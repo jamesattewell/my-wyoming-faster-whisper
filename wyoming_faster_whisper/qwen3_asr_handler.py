@@ -45,6 +45,7 @@ from tokenizers import Tokenizer
 
 from .const import Transcriber, qwen3_asr_language
 from .device import onnx_providers, warn_if_no_onnx_gpu
+from .vad import clip_to_speech
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -464,7 +465,7 @@ class Qwen3AsrTranscriber(Transcriber):
 
         WAV file must be 16Khz 16-bit mono audio. Decoding is greedy, so
         beam_size is ignored. initial_prompt is used as biasing context rather
-        than as a transcript prefix.
+        than as a transcript prefix. Returns "" when VAD finds no speech.
         """
         wav_file: wave.Wave_read = wave.open(str(wav_path), "rb")
         with wav_file:
@@ -472,6 +473,14 @@ class Qwen3AsrTranscriber(Transcriber):
             assert wav_file.getsampwidth() == 2, "Width must be 16-bit (2 bytes)"
             assert wav_file.getnchannels() == 1, "Audio must be mono"
             audio_bytes = wav_file.readframes(wav_file.getnframes())
+
+        # Unlike Whisper, this model has no notion of "no speech": given audio
+        # with nothing in it, it falls back on the only text in its context and
+        # echoes the biasing prompt back as the transcript. So never decode
+        # audio that VAD finds no speech in.
+        if not clip_to_speech(audio_bytes):
+            _LOGGER.debug("No speech detected; skipping transcription")
+            return ""
 
         audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         mel = _log_mel_spectrogram(audio, self._mel_filters)
