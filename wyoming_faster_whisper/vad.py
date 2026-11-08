@@ -1,7 +1,8 @@
 """Clip audio to its speech region with pysilero-vad before running STT.
 
-Trimming leading/trailing non-speech reduces Whisper hallucinations on silence
-and shortens the audio the model has to process. Audio is 16 kHz 16-bit mono PCM.
+Trimming leading/trailing non-speech shortens the audio the model has to
+process -- Qwen3-ASR's cost grows with audio length -- and gives it less silence
+to hallucinate on. Audio is 16 kHz 16-bit mono PCM.
 """
 
 import logging

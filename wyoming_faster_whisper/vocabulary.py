@@ -1,17 +1,16 @@
 """Turn Home Assistant names into a budgeted biasing prompt.
 
-Whisper accepts an ``initial_prompt`` that conditions the decoder, and biasing it
-toward the names in the user's home is the cheapest accuracy win available: it
-takes proper nouns the model has never heard ("Ecobee", "Nanit") from garbage to
-correct without changing model, audio, or decode settings. Qwen3-ASR takes the
-same string as its context prompt.
+Qwen3-ASR accepts free-form context text in its chat template's system turn, and
+biasing it toward the names in the user's home is the cheapest accuracy win
+available: it takes proper nouns the model has never heard ("Ecobee", "Nanit")
+from garbage to correct without changing model, audio, or decode settings.
 
-The catch is size. Whisper's decoder context is 448 tokens and the prompt is
-hard-capped at ``max_length // 2 - 1`` == 223, past which it is silently
-truncated -- and quality degrades well before the cap, because a long prompt
-makes the model hallucinate and echo words that were never spoken. A house with
-200 exposed entities cannot be sent wholesale, so the names are placed in
-priority order and cut off at a budget:
+The catch is size. The model has to read the prompt before it decodes anything,
+at a few milliseconds per token. The decoder only computes it once while the
+names are unchanged, but every rename pays for it again, and a long prompt
+lengthens every pass of the decoder. A house with 200 exposed entities cannot be
+sent wholesale, so the names are placed in priority order and cut off at a
+budget:
 
   1. areas and floors that hold an exposed entity -- few in number, spoken in
      nearly every command ("turn on the *office* lamp"), and demonstrably real
@@ -46,7 +45,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 _LOGGER = logging.getLogger(__name__)
 
-# Stay well under Whisper's hard cap of 223.
 DEFAULT_PROMPT_MAX_TOKENS = 200
 
 # Counts tokens in a candidate prompt using the model's own tokenizer.
@@ -54,21 +52,6 @@ CountTokens = Callable[[str], int]
 
 # Punctuation that already separates a prefix from the name list.
 _PREFIX_ENDINGS = (".", ":", ",", ";", "!", "?")
-
-
-def estimate_tokens(text: str) -> int:
-    """Approximate a token count when the model's tokenizer is unavailable.
-
-    Deliberately an over-estimate. Going under means Whisper silently truncates
-    the prompt, which is worse than fitting fewer names than we could have.
-
-    Measured against Whisper's own BPE, a comma-joined list of realistic entity
-    names runs about 2.95 characters per token, so 2 leaves comfortable headroom.
-    This is only ever called on a whole candidate prompt, which is long; a very
-    short string on its own can still come in under (rare names are dense --
-    "Nanit" is 5 characters but 3 tokens), and that does not matter here.
-    """
-    return max(1, len(text) // 2)
 
 
 def clean_names(*groups: Iterable[Any]) -> List[str]:
@@ -119,10 +102,10 @@ class RecognitionContext:
     # Every other exposed entity.
     other_entities: List[str] = field(default_factory=list)
 
-    # Cached by (prefix, budget, tokenizer). Building the prompt costs one
-    # tokenizer call per name, and the same prompt is reused for every utterance
-    # until the names change.
-    _prompts: Dict[Tuple[str, int, str], Optional[str]] = field(
+    # Cached by (prefix, budget). Building the prompt costs one tokenizer call
+    # per name, and the same prompt is reused for every utterance until the
+    # names change. The process has one model, so one tokenizer.
+    _prompts: Dict[Tuple[str, int], Optional[str]] = field(
         default_factory=dict, compare=False, repr=False
     )
 
@@ -143,24 +126,22 @@ class RecognitionContext:
             or self.other_entities
         )
 
-    def whisper_prompt(
+    def biasing_prompt(
         self,
         count_tokens: CountTokens,
         max_tokens: int = DEFAULT_PROMPT_MAX_TOKENS,
         prefix: Optional[str] = None,
-        tokenizer_key: str = "",
     ) -> Optional[str]:
         """A comma-joined prompt of as many names as fit within ``max_tokens``.
 
         ``count_tokens`` should use the model's own tokenizer so the budget is
-        exact for that model; ``tokenizer_key`` identifies it for caching.
-        ``prefix`` is the server's configured ``--initial-prompt``, kept at the
-        front and always included -- an explicit setting outranks anything
-        discovered from Home Assistant.
+        exact. ``prefix`` is the server's configured ``--initial-prompt``, kept
+        at the front and always included -- an explicit setting outranks
+        anything discovered from Home Assistant.
 
         Returns None when there is nothing to send at all.
         """
-        key = (prefix or "", max_tokens, tokenizer_key)
+        key = (prefix or "", max_tokens)
         if key not in self._prompts:
             self._prompts[key] = self._build_prompt(count_tokens, max_tokens, prefix)
 

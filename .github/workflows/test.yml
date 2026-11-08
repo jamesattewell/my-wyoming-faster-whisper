@@ -24,7 +24,20 @@ jobs:
 
       - name: Install
         run: |
-          script/setup --dev --transformers --qwen3-asr --hass
+          script/setup --dev --hass
+
+      # The end-to-end tests need the default model (~785 MB) in local/. Keyed
+      # on the model id, so changing DEFAULT_MODEL starts a fresh cache.
+      - name: Find the default model
+        id: model
+        run: |
+          .venv/bin/python -c "from wyoming_faster_whisper.const import DEFAULT_MODEL; print('id=' + DEFAULT_MODEL.replace('/', '--'))" >> "$GITHUB_OUTPUT"
+
+      - name: Cache the model
+        uses: actions/cache@v4
+        with:
+          path: local
+          key: model-${{ steps.model.outputs.id }}
 
       - name: Run tests
         run: script/test

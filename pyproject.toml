@@ -1,20 +1,19 @@
 [project]
 name = "wyoming-faster-whisper"
 version = "3.9.0"
-description = "Wyoming Server for Faster Whisper"
+description = "Wyoming server for Qwen3-ASR"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [
     {name = "Michael Hansen", email = "mike@rhasspy.org"}
 ]
-keywords = ["rhasspy", "wyoming", "whisper", "stt"]
+keywords = ["rhasspy", "wyoming", "qwen3-asr", "stt"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
     "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -23,9 +22,14 @@ classifiers = [
 ]
 dependencies = [
     "wyoming>=1.10.2,<2",
-    "faster-whisper>=1.2.1,<2",
-    # faster-whisper 1.2.1 passes metadata_errors to av.open(), which PyAV 19 removed
-    "av>=11,<19",
+    # For CUDA, swap this for onnxruntime-gpu after installing; see the README.
+    "onnxruntime>=1.18.1",
+    "tokenizers>=0.20",
+    # 0.23 writes plain files into local_dir; earlier versions symlink large
+    # files into the cache, which onnxruntime refuses (see qwen3_asr_handler)
+    "huggingface-hub>=0.23",
+    # sliding_window_view, used by the mel front-end, arrived in 1.20
+    "numpy>=1.20",
     "pysilero-vad>=3.4.0,<4",
 ]
 
@@ -70,41 +74,6 @@ dev = [
     "pylint",
     "pytest",
     "pytest-asyncio",
-]
-transformers = [
-    "transformers[torch]==4.52.4",
-]
-sherpa = [
-    "sherpa-onnx>=1.12.19,<2",
-]
-onnx_asr = [
-    "onnx-asr[cpu,hub]==0.11.0",
-]
-funasr = [
-    "funasr>=1.1.0,<2",
-]
-qwen3_asr = [
-    "onnxruntime>=1.18.1",
-    "tokenizers>=0.20",
-]
-# GPU counterparts of the two onnxruntime-based extras. onnxruntime and
-# onnxruntime-gpu both provide the "onnxruntime" module and cannot be installed
-# together, and onnxruntime-gpu does not satisfy a requirement on onnxruntime -
-# so these have to be separate extras rather than an add-on to the ones above.
-#
-# These are not sufficient on their own: faster-whisper requires onnxruntime, so
-# the CPU package still arrives and, installed second, clobbers the GPU one. See
-# Dockerfile.gpu for the reconciliation step.
-onnx_asr_gpu = [
-    "onnx-asr[gpu,hub]==0.11.0",
-]
-qwen3_asr_gpu = [
-    # <1.27 keeps this on the CUDA 12 line: onnxruntime-gpu 1.27.0 moved to
-    # CUDA 13, which does not match the CUDA 12 runtime that CTranslate2 and the
-    # sherpa-onnx CUDA build need. The bound applies to onnx_asr_gpu too, since
-    # both extras resolve together.
-    "onnxruntime-gpu>=1.19,<1.27",
-    "tokenizers>=0.20",
 ]
 hass = [
     "aiohttp>=3.8,<4",

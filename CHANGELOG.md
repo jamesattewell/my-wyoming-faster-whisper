@@ -1,5 +1,70 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking:** Qwen3-ASR is now the only backend. faster-whisper,
+  transformers, sherpa-onnx, onnx-asr and FunASR are removed, along with the
+  per-language backend routing and model guessing that chose between them
+  - onnxruntime, tokenizers and huggingface-hub are core dependencies; the
+    `qwen3_asr`, `qwen3_asr_gpu`, `transformers`, `sherpa`, `onnx_asr`,
+    `onnx_asr_gpu` and `funasr` extras are gone. `script/setup` keeps only
+    `--dev` and `--hass`
+  - `--model` defaults to `rhasspy/qwen3-asr-0.6b-onnx-int4-merged`; the
+    `auto` value and the `tiny-int8`-style shorthands no longer exist
+  - Removed options: `--stt-library`, `--compute-type`, `--beam-size`,
+    `--whisper-task`, `--vad-filter`, `--vad-threshold`, `--vad-min-speech-ms`,
+    `--vad-min-silence-ms`, `--sherpa-streaming`. Their `WYO_WHISPER_*`
+    variables are now reported as unknown at startup
+  - `--vad-clip` is a plain on/off flag rather than a list of libraries. As an
+    environment variable it now takes a true/false value; an empty
+    `WYO_WHISPER_VAD_CLIP=` used to mean "on for every library" and now means off
+  - The Wyoming info reports a `qwen3-asr` program with Qwen attribution
+  - The model is loaded once at startup and shared by every connection, so
+    the streaming code path and the background per-language loading are gone
+  - Neither Docker image installs torch any more
+  - Only the merged decoder export (`decoder_merged.int4.onnx`) is supported.
+    The split export (`decoder_init`/`decoder_step`, e.g.
+    `rhasspy/qwen3-asr-0.6b-onnx-int4`) re-read the biasing prompt on every
+    utterance — 3.42s vs 2.20s for a 3.2s command with 50 names on a Pi 5 — and
+    is now refused at startup with a message naming the missing files
+
+- The model is downloaded into a plain folder named after its repo
+  (`<download-dir>/rhasspy/qwen3-asr-0.6b-onnx-int4-merged`) instead of the
+  Hugging Face cache layout. With huggingface_hub 2.x the cache's symlinks
+  resolve each `.onnx` graph and its `.data` weights into different
+  directories, which onnxruntime 1.31 rejects ("External data path escapes model
+  directory"), so a fresh install could not load the model at all
+  - Existing installs download the model once more; the old
+    `models--rhasspy--qwen3-asr-*` folders can be deleted
+  - Whether the model is present is now decided by checking for its files, so a
+    restart never contacts the hub, and an interrupted download is completed
+  - Requires huggingface-hub 0.23 or newer: earlier versions symlink large
+    files from `local_dir` back into the cache, recreating the problem
+  - A repo id without the merged decoder files, or a `--model` path that does
+    not exist, is now a clear error at startup instead of an onnxruntime
+    failure (or a request to the hub for a repo that cannot exist)
+
+- `--language` now also applies to clients that never send a `Transcribe`
+  event; previously they always got auto-detection. Home Assistant always sends
+  one, so it is unaffected
+- `script/run`, `script/lint` and `script/format` no longer derive the package
+  name from the checkout's folder name, which broke them in any clone not named
+  `wyoming-faster-whisper`
+- `requires-python` is now 3.9, which the code already needed
+  (`asyncio.to_thread`)
+- The CPU image no longer adds the piwheels index, which only serves 32-bit
+  Raspberry Pi wheels; the image is built for amd64 and arm64
+- Environment variables no longer support options that take several values or
+  have `choices`. No option uses either any more, and adding one now fails the
+  tests instead of being parsed incorrectly
+- Releases no longer push to upstream's Docker Hub image or PyPI project, which
+  a fork cannot publish to; the release workflow builds the image without
+  pushing and creates the GitHub Release on this repository. CI caches the
+  default model between runs
+- The end-to-end tests cover Qwen3-ASR's biasing ("Ecobee" spelled right only
+  with the names in the prompt), all seven `living_room_light_*` recordings with
+  the language forced and auto-detected, and the French recording
+
 ## 3.9.0
 
 - The languages reported to Home Assistant now follow the backend that will

@@ -1,15 +1,14 @@
-"""Tests for what the dispatch handler actually hands the transcriber.
+"""Tests for what the event handler actually hands the transcriber.
 
-Drives real Wyoming events through ``handle_event`` with a fake transcriber and
-loader, so the whole biasing path is covered in-process: AudioStart starts the
-refresh, AudioStop waits for it, and the resulting prompt reaches
-``transcribe()``. No model and no network.
+Drives real Wyoming events through ``handle_event`` with a fake transcriber, so
+the whole biasing path is covered in-process: AudioStart starts the refresh,
+AudioStop waits for it, and the resulting prompt reaches ``transcribe()``. No
+model and no network.
 """
 
 import asyncio
-import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Union
 
 import pytest
 
@@ -20,116 +19,45 @@ from wyoming.asr import Transcribe, Transcript  # noqa: E402
 from wyoming.audio import AudioChunk, AudioStart, AudioStop  # noqa: E402
 from wyoming.info import Info  # noqa: E402
 
-from wyoming_faster_whisper.const import (  # noqa: E402
-    StreamingSession,
-    SttLibrary,
-    Transcriber,
-)
-from wyoming_faster_whisper.dispatch_handler import DispatchEventHandler  # noqa: E402
+from wyoming_faster_whisper.const import Transcriber  # noqa: E402
+from wyoming_faster_whisper.handler import TranscriptionHandler  # noqa: E402
 from wyoming_faster_whisper.hass_api import HomeAssistantError  # noqa: E402
-from wyoming_faster_whisper.models import vad_clip_enabled  # noqa: E402
 from wyoming_faster_whisper.name_cache import HassNameCache  # noqa: E402
 from wyoming_faster_whisper.vocabulary import RecognitionContext  # noqa: E402
 
 RATE = 16000
 
 
-class FakeSession(StreamingSession):
-    """Records the prompt its stream was opened with."""
-
-    def __init__(self, initial_prompt: Optional[str]) -> None:
-        self.initial_prompt = initial_prompt
-        self.chunks: List[bytes] = []
-
-    def accept_chunk(self, audio_bytes: bytes) -> None:
-        self.chunks.append(audio_bytes)
-
-    def finish(self) -> str:
-        return "streamed transcript"
-
-
 class FakeTranscriber(Transcriber):
-    """Captures every call, and can pretend to have (or lack) a tokenizer."""
+    """Captures every call. Counts one token per word, times a multiplier."""
 
-    def __init__(
-        self,
-        streaming: bool = False,
-        tokens_per_word: Optional[int] = None,
-    ) -> None:
+    def __init__(self, tokens_per_word: int = 1) -> None:
         self.calls: List[Dict[str, Any]] = []
-        self.sessions: List[FakeSession] = []
-        self._streaming = streaming
         self._tokens_per_word = tokens_per_word
 
     def transcribe(
         self,
         wav_path: Union[str, Path],
         language: Optional[str],
-        beam_size: int = 5,
         initial_prompt: Optional[str] = None,
     ) -> str:
         self.calls.append(
             {
                 "language": language,
-                "beam_size": beam_size,
                 "initial_prompt": initial_prompt,
                 "wav_path": str(wav_path),
             }
         )
         return "fake transcript"
 
-    def count_prompt_tokens(self, text: str) -> Optional[int]:
-        if self._tokens_per_word is None:
-            # Stands in for a backend with no tokenizer to ask.
-            return None
-
+    def count_prompt_tokens(self, text: str) -> int:
         return len(text.split()) * self._tokens_per_word
-
-    @property
-    def supports_streaming(self) -> bool:
-        return self._streaming
-
-    def start_stream(
-        self,
-        language: Optional[str] = None,
-        beam_size: int = 5,
-        initial_prompt: Optional[str] = None,
-    ) -> StreamingSession:
-        session = FakeSession(initial_prompt)
-        self.sessions.append(session)
-        return session
 
     @property
     def prompt(self) -> Optional[str]:
         """The prompt from the last transcribe() call."""
         assert self.calls, "transcribe() was never called"
         return self.calls[-1]["initial_prompt"]
-
-
-class FakeLoader:
-    """Just the attributes DispatchEventHandler reads off ModelLoader."""
-
-    def __init__(
-        self, transcriber: FakeTranscriber, initial_prompt: Optional[str] = None
-    ) -> None:
-        self.transcriber = transcriber
-        self.initial_prompt = initial_prompt
-        self.beam_size = 5
-        self.preferred_language = "en"
-        self.vad_clip = False
-        self.vad_clip_threshold = 0.5
-        self.vad_clip_pad_ms = 400
-        self.vad_clip_libraries: Optional[Set[SttLibrary]] = None
-        self.stt_library = SttLibrary.QWEN3_ASR
-
-    async def load_transcriber(self, language: Optional[str] = None) -> Transcriber:
-        return self.transcriber
-
-    def should_vad_clip(self, language: Optional[str] = None) -> bool:
-        # Defer to the real predicate so the fake cannot drift from production.
-        return vad_clip_enabled(
-            self.stt_library, self.vad_clip, self.vad_clip_libraries
-        )
 
 
 class FakeHass:
@@ -152,7 +80,7 @@ class FakeHass:
         return self.context
 
 
-class Handler(DispatchEventHandler):
+class Handler(TranscriptionHandler):
     """Captures written events instead of needing a socket."""
 
     def __init__(self, *args, **kwargs) -> None:
@@ -175,20 +103,13 @@ def _names(*entities) -> RecognitionContext:
     return RecognitionContext(priority_entities=list(entities))
 
 
-def _handler(
-    transcriber, names=None, initial_prompt=None, vad_endpointing=None
-) -> Handler:
-    return Handler(
-        Info(),
-        FakeLoader(transcriber, initial_prompt),
-        names,
-        None,
-        None,
-        vad_endpointing=vad_endpointing,
-    )
+def _handler(transcriber, names=None, **kwargs) -> Handler:
+    kwargs.setdefault("language", "en")
+    return Handler(Info(), transcriber, names, None, None, **kwargs)
 
 
 def _cache(hass, **kwargs) -> HassNameCache:
+    kwargs.setdefault("count_tokens", lambda text: len(text.split()))
     kwargs.setdefault("max_tokens", 1000)
     return HassNameCache(hass, **kwargs)
 
@@ -331,22 +252,16 @@ async def test_the_budget_uses_the_models_own_tokenizer():
     # 10 tokens per word: "Ecobee, Nanit." is 2 words -> 20, over a 15 budget,
     # so only the first name fits.
     transcriber = FakeTranscriber(tokens_per_word=10)
-    cache = _cache(FakeHass(_names("Ecobee", "Nanit")), max_tokens=15)
+    cache = _cache(
+        FakeHass(_names("Ecobee", "Nanit")),
+        count_tokens=transcriber.count_prompt_tokens,
+        max_tokens=15,
+    )
     handler = _handler(transcriber, names=cache)
 
     await _utterance(handler)
 
     assert transcriber.prompt == "Ecobee."
-
-
-async def test_a_backend_without_a_tokenizer_still_gets_a_prompt():
-    # count_prompt_tokens returns None, so the character estimate is used.
-    transcriber = FakeTranscriber(tokens_per_word=None)
-    handler = _handler(transcriber, names=_cache(FakeHass(_names("Ecobee", "Nanit"))))
-
-    await _utterance(handler)
-
-    assert transcriber.prompt == "Ecobee, Nanit."
 
 
 # --- degradation ---------------------------------------------------------
@@ -423,103 +338,73 @@ async def test_vad_endpointing_sends_one_transcript_before_audio_stop():
     assert len(transcriber.calls) == 1
 
 
-# --- streaming path ------------------------------------------------------
+# --- --vad-clip ------------------------------------------------------------
 
 
-async def test_a_streaming_session_gets_the_names_already_on_hand():
-    hass = FakeHass(_names("Ecobee"))
-    cache = _cache(hass)
-    await cache.refresh()
-
-    transcriber = FakeTranscriber(streaming=True)
-    handler = _handler(transcriber, names=cache)
-
-    await _utterance(handler)
-
-    assert transcriber.sessions
-    assert transcriber.sessions[0].initial_prompt == "Ecobee."
-    assert handler.transcript == "streamed transcript"
-
-
-async def test_a_streaming_session_does_not_wait_for_a_slow_fetch():
-    # The prompt is needed at the start of the audio, so there is nothing to
-    # wait for: the session opens with the prefix alone, immediately.
-    #
-    # The timing assert is the real check. Waiting would still end up with
-    # "Vocabulary:" once the timeout expired, so only elapsed time distinguishes
-    # "did not wait" from "waited and gave up".
-    hass = FakeHass(_names("Ecobee"), delay=30.0)
-    transcriber = FakeTranscriber(streaming=True)
-    handler = _handler(
-        transcriber,
-        names=_cache(hass, prefix="Vocabulary:", wait_timeout=30.0),
-        initial_prompt="Vocabulary:",
-    )
-
-    start = time.monotonic()
-    await _utterance(handler)
-    elapsed = time.monotonic() - start
-
-    assert transcriber.sessions[0].initial_prompt == "Vocabulary:"
-    assert elapsed < 1.0, f"streaming start blocked for {elapsed:.1f}s"
-
-
-# --- --vad-clip library selection -----------------------------------------
-
-
-async def test_clipping_is_skipped_for_a_library_that_was_not_named():
-    """`--vad-clip qwen3-asr` must not clip for other backends."""
+async def test_clipping_is_skipped_when_disabled():
     transcriber = FakeTranscriber()
-    handler = _handler(transcriber)
-    handler._loader.vad_clip = True
-    handler._loader.vad_clip_libraries = {SttLibrary.QWEN3_ASR}
-    handler._loader.stt_library = SttLibrary.FASTER_WHISPER
-
-    await _utterance(handler)
-
-    # The untouched recording is transcribed, not the clipped copy.
-    assert transcriber.calls[-1]["wav_path"] == handler._wav_path
-
-
-async def test_clipping_is_attempted_for_a_named_library():
-    transcriber = FakeTranscriber()
-    handler = _handler(transcriber)
-    handler._loader.vad_clip = True
-    handler._loader.vad_clip_libraries = {SttLibrary.QWEN3_ASR}
-    handler._loader.stt_library = SttLibrary.QWEN3_ASR
+    handler = _handler(transcriber, vad_clip=False)
 
     clipped: List[str] = []
 
     def fake_clip(src, dst, threshold, pad_ms) -> bool:
         clipped.append(str(src))
-        return False  # silence only: fall back to the original WAV
+        return True
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(
-            "wyoming_faster_whisper.dispatch_handler.clip_wav_to_speech", fake_clip
-        )
+        patch.setattr("wyoming_faster_whisper.handler.clip_wav_to_speech", fake_clip)
         await _utterance(handler)
 
-    assert clipped == [handler._wav_path]
+    assert not clipped
+    assert transcriber.calls[-1]["wav_path"] == handler._wav_path
 
 
-# --- the language that reaches the loader ---------------------------------
+async def test_clipped_audio_is_transcribed_when_speech_is_found():
+    transcriber = FakeTranscriber()
+    handler = _handler(
+        transcriber, vad_clip=True, vad_clip_threshold=0.3, vad_clip_pad_ms=100
+    )
+
+    calls: List[Any] = []
+
+    def fake_clip(src, dst, threshold, pad_ms) -> bool:
+        calls.append((str(src), threshold, pad_ms))
+        return True
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("wyoming_faster_whisper.handler.clip_wav_to_speech", fake_clip)
+        await _utterance(handler)
+
+    assert calls == [(handler._wav_path, 0.3, 100)]
+    assert transcriber.calls[-1]["wav_path"] == handler._clipped_wav_path
+
+
+async def test_silence_only_falls_back_to_the_original_audio():
+    transcriber = FakeTranscriber()
+    handler = _handler(transcriber, vad_clip=True)
+
+    def fake_clip(src, dst, threshold, pad_ms) -> bool:
+        return False  # no speech found
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("wyoming_faster_whisper.handler.clip_wav_to_speech", fake_clip)
+        await _utterance(handler)
+
+    assert transcriber.calls[-1]["wav_path"] == handler._wav_path
+
+
+# --- the language that reaches the transcriber -----------------------------
 
 
 def _language_after(requested, preferred="en"):
     """Report what the handler resolves a client's Transcribe language to."""
-    handler = _handler(FakeTranscriber())
-    handler._loader.preferred_language = preferred  # noqa: SLF001
+    handler = _handler(FakeTranscriber(), language=preferred)
     asyncio.run(handler.handle_event(Transcribe(language=requested).event()))
     return handler._language  # noqa: SLF001
 
 
 def test_auto_language_is_treated_as_no_language() -> None:
-    """A client can ask for detection by name; backends spell that as None.
-
-    Passing "auto" through would reach whisper_language, which warns on every
-    utterance and then auto-detects anyway.
-    """
+    """A client can ask for detection by name; the model spells that as None."""
     assert _language_after("auto", preferred=None) is None
 
 
@@ -533,3 +418,18 @@ def test_explicit_language_is_kept() -> None:
 
 def test_missing_language_falls_back_to_the_preferred_language() -> None:
     assert _language_after(None, preferred="de") == "de"
+
+
+async def test_the_default_language_applies_without_a_transcribe_event():
+    """--language must not depend on the client sending Transcribe."""
+    transcriber = FakeTranscriber()
+    handler = _handler(transcriber, language="de")
+
+    for _ in range(2):  # and again after the first utterance resets
+        await handler.handle_event(AudioStart(rate=RATE, width=2, channels=1).event())
+        await handler.handle_event(
+            AudioChunk(audio=b"\x00\x00" * 160, rate=RATE, width=2, channels=1).event()
+        )
+        await handler.handle_event(AudioStop().event())
+
+    assert [call["language"] for call in transcriber.calls] == ["de", "de"]

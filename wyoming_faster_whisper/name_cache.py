@@ -20,14 +20,8 @@ import logging
 import time
 from typing import Optional
 
-from .const import Transcriber
 from .hass_api import HomeAssistant, HomeAssistantError
-from .vocabulary import (
-    DEFAULT_PROMPT_MAX_TOKENS,
-    CountTokens,
-    RecognitionContext,
-    estimate_tokens,
-)
+from .vocabulary import DEFAULT_PROMPT_MAX_TOKENS, CountTokens, RecognitionContext
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,12 +32,15 @@ class HassNameCache:
     def __init__(
         self,
         hass: HomeAssistant,
+        count_tokens: CountTokens,
         prefix: Optional[str] = None,
         max_tokens: int = DEFAULT_PROMPT_MAX_TOKENS,
         refresh_seconds: float = 0.0,
         wait_timeout: float = 1.0,
     ) -> None:
         self._hass = hass
+        # The model's own tokenizer, so the budget is exact.
+        self._count_tokens = count_tokens
         self._prefix = prefix
         self._max_tokens = max_tokens
 
@@ -105,28 +102,18 @@ class HassNameCache:
                 self._wait_timeout,
             )
 
-    async def initial_prompt(
-        self,
-        transcriber: Optional[Transcriber] = None,
-        wait: bool = True,
-    ) -> Optional[str]:
-        """The prompt for this utterance: configured prefix plus current names.
-
-        ``wait`` is False on the streaming path, where the prompt is needed at
-        the start of the audio and there is nothing to wait for yet.
-        """
-        if wait:
-            await self.wait_for_refresh()
+    async def initial_prompt(self) -> Optional[str]:
+        """The prompt for this utterance: configured prefix plus current names."""
+        await self.wait_for_refresh()
 
         context = self._context
         if context is None:
             return self._prefix
 
-        prompt = context.whisper_prompt(
-            self._token_counter(transcriber),
+        prompt = context.biasing_prompt(
+            self._count_tokens,
             max_tokens=self._max_tokens,
             prefix=self._prefix,
-            tokenizer_key=_tokenizer_key(transcriber),
         )
         return prompt or self._prefix
 
@@ -167,28 +154,3 @@ class HassNameCache:
 
         self._context = context
         _LOGGER.debug("Names updated (%s total)", len(context.all_names()))
-
-    def _token_counter(self, transcriber: Optional[Transcriber]) -> CountTokens:
-        """Count with the model's own tokenizer, or estimate if it has none."""
-
-        def count(text: str) -> int:
-            if transcriber is not None:
-                tokens = transcriber.count_prompt_tokens(text)
-                if tokens is not None:
-                    return tokens
-
-            return estimate_tokens(text)
-
-        return count
-
-
-def _tokenizer_key(transcriber: Optional[Transcriber]) -> str:
-    """Identify a transcriber's tokenizer for prompt caching.
-
-    ``id()`` is stable here because ModelLoader caches transcribers for the life
-    of the process, so one is never freed and its address never reused.
-    """
-    if transcriber is None:
-        return "estimate"
-
-    return f"{type(transcriber).__name__}:{id(transcriber)}"

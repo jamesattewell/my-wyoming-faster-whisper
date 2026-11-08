@@ -1,34 +1,65 @@
-# Wyoming Faster Whisper
+# Wyoming Qwen3-ASR
 
-[Wyoming protocol](https://github.com/rhasspy/wyoming) server for the [faster-whisper](https://github.com/guillaumekln/faster-whisper/) speech to text system.
+[Wyoming protocol](https://github.com/rhasspy/wyoming) server for the
+[Qwen3-ASR](https://huggingface.co/Qwen) speech to text model, run through
+onnxruntime.
 
-## Home Assistant Add-on
-
-[![Show add-on](https://my.home-assistant.io/badges/supervisor_addon.svg)](https://my.home-assistant.io/redirect/supervisor_addon/?addon=core_whisper)
-
-[Source](https://github.com/home-assistant/addons/tree/master/whisper)
+This is a fork of
+[wyoming-faster-whisper](https://github.com/OHF-Voice/wyoming-faster-whisper)
+cut down to its Qwen3-ASR backend. The Python package
+(`wyoming_faster_whisper`), the command (`wyoming-faster-whisper`) and the
+`WYO_WHISPER_*` environment variables keep their upstream names, so existing
+configurations carry over.
 
 ## Local Install
 
 Clone the repository and set up Python virtual environment:
 
 ``` sh
-git clone https://github.com/OHF-Voice/wyoming-faster-whisper.git
-cd wyoming-faster-whisper
+git clone https://github.com/jamesattewell/my-wyoming-faster-whisper.git
+cd my-wyoming-faster-whisper
 script/setup
 ```
 
 Run a server anyone can connect to:
 
 ```sh
-script/run --model tiny-int8 --language en --uri 'tcp://0.0.0.0:10300' --data-dir /data --download-dir /data
+script/run --language en --uri 'tcp://0.0.0.0:10300' --data-dir /data
 ```
 
-The `--model` can also be a HuggingFace model like `Systran/faster-distil-whisper-small.en`
-(but see [Distil-Whisper models are not compatible](#distil-whisper-models-are-not-compatible)
-if you want name biasing)
+**NOTE**: Models are downloaded to the first `--data-dir` directory (or
+`--download-dir`, if given).
 
-**NOTE**: Models are downloaded to the first `--data-dir` directory.
+## Model
+
+The default `--model` is `rhasspy/qwen3-asr-0.6b-onnx-int4-merged` (785 MB). It
+can also be another Hugging Face repo with the same files, or a local directory
+holding them:
+
+`config.json`, `tokenizer.json`, `embed_tokens.bin`, `encoder.int4.onnx` (+
+`.data`), `decoder_merged.int4.onnx` (+ `.data`)
+
+Only this *merged* decoder export is supported, because it lets the biasing
+prompt be computed once and reused (see [Prompt cost](#prompt-cost)). The older
+*split* export (`decoder_init`/`decoder_step`, e.g.
+`rhasspy/qwen3-asr-0.6b-onnx-int4`) holds the same weights but is refused at
+startup.
+
+A repo is downloaded into a plain folder named after it under the download
+directory — `/data/rhasspy/qwen3-asr-0.6b-onnx-int4-merged` with
+`--data-dir /data`. It deliberately does not use the Hugging Face cache layout:
+there the files are symlinks into a content-addressed store, which puts each
+`.onnx` graph and its `.data` weights in different directories, and onnxruntime
+refuses to load weights that resolve outside the graph's own directory.
+
+Earlier versions used that cache layout, so after upgrading the model is
+downloaded once more. The old copy is in `models--rhasspy--qwen3-asr-*` folders
+(and, with huggingface_hub 2.x, a top-level `blobs/` folder) in the download
+directory, and can be deleted once nothing else uses that directory as a Hugging
+Face cache.
+
+Decoding is greedy, and `--cpu-threads` (default 4) sets onnxruntime's thread
+count.
 
 ## Server-side VAD Endpointing
 
@@ -47,53 +78,46 @@ before the silence timer starts; brief pauses reset when speech resumes, and a
 command is allowed to run for at least one second. Audio received after the
 endpoint is ignored until the client's eventual `audio-stop`.
 
-This is independent of the existing VAD options. `--vad-filter` still controls
-Faster Whisper's filtering during transcription, while `--vad-clip` still trims
-the completed batch WAV before transcription. They can be used together with
-`--vad-endpointing`; the only intentional interaction is replacing Home
-Assistant's external endpointing while this option is enabled.
+## Clipping Silence
+
+`--vad-clip` trims leading and trailing silence from the recording before it is
+transcribed. Qwen3-ASR's cost grows with the length of the audio, so this
+shortens every request, and it leaves the model less silence to hallucinate on.
+`--vad-clip-threshold` (default 0.5) is the speech probability that counts as
+speech, and `--vad-clip-pad-ms` (default 400) is how much context is kept on
+each side. A recording with no speech detected is transcribed unclipped.
+
+It can be combined with `--vad-endpointing`.
 
 ## Reported Languages
 
-The Wyoming service advertises the languages the **configured backend** can
-actually transcribe, not a fixed list. Under the default `--stt-library auto` the
-backend is chosen per language, with faster-whisper as the fallback for anything
-the specialized backends don't claim, so all of Whisper's languages are reported.
-Pinning a backend narrows it:
+The Wyoming service advertises Qwen3-ASR's 31 languages:
 
-| Backend | Languages |
-| --- | --- |
-| `faster-whisper`, `transformers` | Whisper's 100 (just `en` for a `.en` checkpoint) |
-| `qwen3-asr` | 31 |
-| `sherpa` | 25 (Parakeet TDT v3) |
-| `sherpa --sherpa-streaming` | `de`, `en`, `es`, `fr` (the published Kroko models) |
-| `funasr` | `en`, `ja`, `ko`, `yue`, `zh`, `zh-CN`, `zh-HK`, `zh-TW` (SenseVoice) |
-| `onnx-asr` | `ru` (GigaAM) |
+`ar`, `cs`, `da`, `de`, `el`, `en`, `es`, `fa`, `fi`, `fil`, `fr`, `hi`, `hu`,
+`id`, `it`, `ja`, `ko`, `mk`, `ms`, `nl`, `pl`, `pt`, `ro`, `ru`, `sv`, `th`,
+`tr`, `vi`, `yue`, `zh`, `zh-HK`
 
 `--language` is checked against this list at startup, and a region-qualified code
-is accepted everywhere — `en-US` selects the same backend and model as `en`, and
-`zh-HK`/`zh_HK` stays Cantonese rather than falling back to Mandarin.
+is accepted everywhere — `en-US` is treated as `en`, and `zh-HK`/`zh_HK` stays
+Cantonese rather than falling back to Mandarin. A language the model does not
+know, or `auto`, lets it detect the language itself.
 
 This matters because Home Assistant picks the pipeline's STT language out of this
-list. A backend that over-reports gets handed languages it will transcribe as
-gibberish; one that under-reports is unreachable for languages it handles well.
-
-Codes are reported in the form Home Assistant matches against, which is why
+list. Codes are reported in the form Home Assistant matches against, which is why
 Cantonese is advertised as **`zh-HK`** rather than only `yue`. Home Assistant
 treats `yue` and `zh` as unrelated languages, and `home-assistant/intents` ships
-`zh-CN`/`zh-HK`/`zh-TW` with no bare `zh` or `yue` — so a backend that says only
-`yue` can never be reached by a Cantonese pipeline. Both Cantonese-capable
-backends (`funasr`, `qwen3-asr`) advertise `zh-HK` and decode it as Cantonese,
-while `zh-CN` and `zh-TW` still fall through to Mandarin.
+`zh-CN`/`zh-HK`/`zh-TW` with no bare `zh` or `yue` — so a server that says only
+`yue` can never be reached by a Cantonese pipeline. `zh-CN` and `zh-TW` still
+fall through to Mandarin.
 
 ## Biasing Toward Your Home Assistant Names
 
-Whisper has never heard of your thermostat. "What's the temperature of the Ecobee?"
-comes back as "What's the temperature of the incubi?" — the acoustics were fine,
-the model just has no reason to think that word exists.
+The model has never heard of your thermostat. "What's the temperature of the
+Ecobee?" comes back as "What's the temperature of the Igboy?" — the acoustics were
+fine, the model just has no reason to think that word exists.
 
 Given a long-lived access token, the server reads the names in your home over the
-Home Assistant websocket API and feeds them to the model as a prompt, which fixes
+Home Assistant websocket API and feeds them to the model as context, which fixes
 exactly that class of error:
 
 ```sh
@@ -101,10 +125,10 @@ script/run --uri 'tcp://0.0.0.0:10300' --data-dir /data \
     --hass-token "$TOKEN" --hass-api 'http://homeassistant.local:8123/api'
 ```
 
-Requires the `hass` extra:
+Requires the `hass` extra (`script/setup --hass`, or):
 
 ```sh
-pip install 'wyoming-faster-whisper[hass]'
+pip install '.[hass]'
 ```
 
 It collects the names of **conversation-exposed** entities and their aliases, plus
@@ -122,7 +146,7 @@ are used, or none at all, and the transcript still comes back.
 | `--hass-token` | | Long-lived access token. Enables everything above. Use `WYO_WHISPER_HASS_TOKEN_FILE` to keep it off the command line (see [Environment Variables](#environment-variables)). |
 | `--hass-api` | `http://homeassistant.local:8123/api` | Where to find Home Assistant. |
 | `--hass-refresh-seconds` | `0` | Minimum seconds between refreshes. `0` refreshes every utterance, so a rename takes effect immediately. |
-| `--hass-prompt-max-tokens` | `200` | Token budget for names. Whisper's hard cap is 223 and quality falls off before it. |
+| `--hass-prompt-max-tokens` | `200` | Token budget for names, counted with the model's own tokenizer. |
 | `--hass-prompt-timeout` | `1.0` | How long to wait on an unfinished refresh before transcribing with the names already on hand. |
 
 A large home has more names than the budget holds, so they are added in priority
@@ -150,43 +174,20 @@ lands in tier 2. Run with `--debug` to see how many names were dropped and the
 exact prompt used. `--initial-prompt` still works and is kept at the front of the
 prompt, ahead of anything discovered from Home Assistant.
 
-This biases `faster-whisper` and `qwen3-asr`, the backends that take a prompt.
-Others ignore it.
+### Prompt Cost
 
-### Distil-Whisper models are not compatible
+The prompt is not free: the model has to read it before it starts decoding, at
+roughly 2.8ms per token, so a 50-name list can double the time for a short
+command.
 
-Distil-Whisper checkpoints (`Systran/faster-distil-whisper-*`, `distil-small.en`,
-`distil-large-v3`, …) were distilled without previous-text conditioning, so a
-prompt is at best wasted on them and at worst destroys the transcription. This
-applies to `--initial-prompt` as much as to `--hass-token`; the server warns at
-startup and sends the prompt anyway, since a very short one may be harmless.
-
-Measured on the same clean commands, comparing no prompt against a 29-name
-(~97-token) list:
-
-| Model | With a prompt |
-| --- | --- |
-| `small.en` | Works as intended: `Natalie Sparkly` → `Natalie's Heart Light` |
-| `distil-small.en` | Breaks from ~52 prompt tokens on: `avg_logprob` falls below -1.0, every temperature fails, output truncates (`Start a timer for 25 minutes` → `Start a timer.`) or loops (`Add Hot Dog, Hot Dog, Hot Dog, …`) |
-| `distil-large-v3` | Inert. No collapse at any size, but no biasing either — `Ecobee` still comes back `EcoBe` with the name in the prompt |
-
-Use a standard Whisper model to bias toward your names.
-
-### Prompt cost on qwen3-asr
-
-For `qwen3-asr` the prompt is not free: the model has to read it before it starts
-decoding, at roughly 2.8ms per token, so a 50-name list can double the time for a
-short command.
-
-The default model avoids this. The prompt sits ahead of the audio in the chat
+The merged decoder avoids this. The prompt sits ahead of the audio in the chat
 template, so its state depends only on the prompt and is computed once, then
-reused for every later utterance. The layout is chosen from the files present, so
-older model directories with `decoder_init`/`decoder_step` keep working as before
-— pass `--model rhasspy/qwen3-asr-0.6b-onnx-int4` to use one.
+reused for every later utterance. The older split export, which is no longer
+supported, re-read it every time.
 
 Measured on a Pi 5 (4 threads, 3.2s command, 50 names):
 
-| | split | merged (default) |
+| | split (unsupported) | merged |
 | --- | --- | --- |
 | latency | 3.42s | 2.20s |
 | peak RSS | 2.25 GB | 1.55 GB |
@@ -202,38 +203,38 @@ byte-identical transcripts with no prompt (5.35% WER for both), and 5.33% vs
 
 ## Docker Image
 
+Build the image and run it:
+
 ``` sh
-docker run -it -p 10300:10300 -v /path/to/local/data:/data rhasspy/wyoming-whisper \
-    --model tiny-int8 --language en
+docker build -t wyoming-qwen3-asr .
+docker run -it -p 10300:10300 -v /path/to/local/data:/data wyoming-qwen3-asr \
+    --language en
 ```
 
 **NOTE**: Models are downloaded to `/data`, so make sure this points to a Docker volume.
-
-[Source](https://github.com/rhasspy/wyoming-addons/tree/master/whisper)
 
 ### Running Without Internet Access
 
 A model that is already downloaded is loaded from disk without contacting
 Hugging Face, so a container that has been started once keeps working on a
-network with no route out. Only a model that is *missing* is fetched.
+network with no route out. Only a model with files *missing* is fetched.
 
 That matters on a network which drops outbound traffic rather than refusing it —
-a Docker bridge marked `internal`, for example. The update check that used to
-run on every start would sit there until the TCP connection timed out, and with
-`restart: always` the container boot-looped.
+a Docker bridge marked `internal`, for example. An update check on every start
+would sit there until the TCP connection timed out, and with `restart: always`
+the container would boot-loop.
 
 To rule out downloads entirely, pass `--local-files-only` (or
-`WYO_WHISPER_LOCAL_FILES_ONLY=true`) once the models you want are in `/data`. A
-model that is not there is then an error instead of a download:
+`WYO_WHISPER_LOCAL_FILES_ONLY=true`) once the model is in `/data`. A model that
+is not there is then an error instead of a download:
 
 ```yaml
 services:
   whisper:
-    image: rhasspy/wyoming-whisper
+    image: wyoming-qwen3-asr
     volumes:
       - ./data:/data
     environment:
-      WYO_WHISPER_MODEL: tiny-int8
       WYO_WHISPER_LANGUAGE: en
       WYO_WHISPER_LOCAL_FILES_ONLY: "true"
     networks:
@@ -244,11 +245,10 @@ networks:
     internal: true
 ```
 
-Both images point `HF_HOME`, `XDG_CACHE_HOME`, and `MODELSCOPE_CACHE` at `/data`
-so the caches these libraries keep outside the model directory land on the
-volume too. The largest is the Xet chunk cache used while downloading, which can
-run to several GB. Outside Docker, set them yourself if you don't want them in
-`~/.cache`.
+Both images point `HF_HOME` and `XDG_CACHE_HOME` at `/data` so the caches kept
+outside the model directory land on the volume too. The largest is the Xet chunk
+cache used while downloading, which can run to several GB. Outside Docker, set
+them yourself if you don't want them in `~/.cache`.
 
 ### Health Check
 
@@ -290,16 +290,12 @@ to the check, so give it the same one:
 
 ### GPU Image
 
-`Dockerfile.gpu` runs the speech-to-text backends on an NVIDIA GPU. **It is not
-published to Docker Hub — you build it yourself**, because it comes out around
-10.7 GB (mostly the CUDA torch wheel) against ~1.6 GB for the CPU image, and
-Home Assistant OS has no GPU passthrough, so everyone who can use it is already
-running Docker directly.
+`Dockerfile.gpu` runs the model on an NVIDIA GPU through onnxruntime's CUDA
+execution provider. Home Assistant OS has no GPU passthrough, so this is for
+people running Docker directly:
 
 ``` sh
-git clone https://github.com/OHF-Voice/wyoming-faster-whisper.git
-cd wyoming-faster-whisper
-docker build -f Dockerfile.gpu -t wyoming-whisper:gpu .
+docker build -f Dockerfile.gpu -t wyoming-qwen3-asr:gpu .
 ```
 
 Running it needs the
@@ -308,52 +304,31 @@ on the host, and `--gpus`:
 
 ``` sh
 docker run -it --gpus all -p 10300:10300 -v /path/to/local/data:/data \
-    wyoming-whisper:gpu --language en
+    wyoming-qwen3-asr:gpu --language en
 ```
 
 `--device cuda` is the default in this image; pass `--device cuda:1` to pick a
-GPU or `--device cpu` to fall back. The default faster-whisper model is
-`Systran/faster-whisper-small` (float16) rather than the int8 model used on the
-CPU, and a GPU can comfortably run much larger ones:
+GPU or `--device cpu` to fall back. The model's weights are int4, which is where
+most of its speed comes from, so the GPU gain is smaller than for an fp32 model.
 
-``` sh
-docker run -it --gpus all -p 10300:10300 -v /path/to/local/data:/data \
-    wyoming-whisper:gpu --model Systran/faster-whisper-large-v3 --language en
-```
-
-Notes and limits:
-
-- **NVIDIA and amd64 only.** CTranslate2, which faster-whisper is built on, has
-  no ROCm or Intel XPU backend and publishes no arm64 CUDA wheel. The
-  torch-based backends (`--stt-library transformers`, `--stt-library funasr`)
-  would work on ROCm or XPU, but that would be a different image.
-- **Budget the disk.** ~10.7 GB for the image, plus build cache. Don't build it
-  on a Pi by accident.
-- **`--stt-library sherpa` runs on the CPU even in this image.** A CUDA
-  sherpa-onnx build exists, but sherpa-onnx bundles its own onnxruntime, and two
-  CUDA-enabled onnxruntime builds in one process segfault. Its default Parakeet
-  models are int8, which the CUDA provider gains little on, so the CPU wheel is
-  the better half of that trade.
-
-If `--device cuda` produces no speedup, check the log: the server warns when the
-installed onnxruntime or sherpa-onnx build has no usable CUDA support.
+If `--device cuda` produces no speedup, check the log: the server warns when
+onnxruntime is not actually using the CUDA provider.
 
 ### GPU Without Docker
 
-For a local install rather than a container, the two onnxruntime-based backends
-have GPU counterparts of their extras — `onnx-asr-gpu` and `qwen3-asr-gpu`,
-which pull `onnxruntime-gpu` in place of `onnxruntime`:
+The package depends on the CPU `onnxruntime`. `onnxruntime-gpu` installs the same
+`onnxruntime` module, and whichever is installed second wins, so swap it in after
+installing:
 
 ``` sh
-pip install 'wyoming-faster-whisper[transformers,onnx-asr-gpu,qwen3-asr-gpu]'
+pip install '.[hass]'
+pip uninstall -y onnxruntime
+pip install 'onnxruntime-gpu>=1.19,<1.27'
 ```
 
-faster-whisper additionally needs a CUDA-enabled CTranslate2 and torch built for
-your CUDA version, and it depends on `onnxruntime` (for its bundled Silero VAD),
-which will pull the CPU package back in and clobber `onnxruntime-gpu` — both
-install the same `onnxruntime` module and whichever lands second wins, silently,
-since the CPU provider still loads every model. Reinstall `onnxruntime-gpu`
-last. `Dockerfile.gpu` does exactly this and is the working reference.
+The `<1.27` bound keeps it on CUDA 12: onnxruntime-gpu 1.27.0 moved to CUDA 13.
+Use a newer version if that is what your system has. `Dockerfile.gpu` does
+exactly this and is the working reference.
 
 ## Environment Variables
 
@@ -366,7 +341,6 @@ underscores and a `WYO_WHISPER_` prefix:
 | --- | --- |
 | `--model` | `WYO_WHISPER_MODEL` |
 | `--language` | `WYO_WHISPER_LANGUAGE` |
-| `--stt-library` | `WYO_WHISPER_STT_LIBRARY` |
 | `--vad-endpointing` | `WYO_WHISPER_VAD_ENDPOINTING` |
 | `--hass-token` | `WYO_WHISPER_HASS_TOKEN` |
 | ...and so on for every option in `--help` | |
@@ -380,14 +354,12 @@ running with a default you thought you had changed.
 A few options don't take a plain string on the command line, so they read one
 specially:
 
-- **Flags** (`--debug`, `--vad-filter`, `--local-files-only`, ...) take
+- **Flags** (`--debug`, `--vad-clip`, `--local-files-only`, ...) take
   `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off`/empty. Unlike a plain "is it
   set?" test, `WYO_WHISPER_DEBUG=false` really does mean off.
 - **`--data-dir`**, which can be repeated, splits on `:` —
   `WYO_WHISPER_DATA_DIR=/data:/media/models`. Passing any `--data-dir` on the
   command line replaces the list rather than adding to it.
-- **`--vad-clip`**, which takes any number of values, splits on commas or
-  spaces. Empty means the flag with no values, i.e. every library.
 - **`--zeroconf`**, whose value is optional, takes the name to announce, or
   empty for the default name.
 
@@ -408,13 +380,12 @@ over the plain variable when both are set, and its trailing newline is stripped.
 ```yaml
 services:
   whisper:
-    image: rhasspy/wyoming-whisper
+    image: wyoming-qwen3-asr
     ports:
       - "10300:10300"
     volumes:
       - ./data:/data
     environment:
-      WYO_WHISPER_MODEL: tiny-int8
       WYO_WHISPER_LANGUAGE: en
       WYO_WHISPER_HASS_API: http://homeassistant.local:8123/api
       WYO_WHISPER_HASS_TOKEN_FILE: /run/secrets/hass_token

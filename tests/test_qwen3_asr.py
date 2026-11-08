@@ -1,50 +1,26 @@
 """Tests for the Qwen3-ASR prompt/front-end helpers.
 
-The model files are multi-GB, so these cover the pure logic only: the chat
-template the decoder is prompted with, and the mel front-end. Skipped when
-onnxruntime is not installed (the handler imports it at module scope).
+These cover the pure logic only: the chat template the decoder is prompted
+with, and the mel front-end. tests/test_e2e.py runs the real model.
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-qwen3_asr_handler = pytest.importorskip(
-    "wyoming_faster_whisper.qwen3_asr_handler",
-    reason="qwen3-asr extra not installed",
-)
+from wyoming_faster_whisper import qwen3_asr_handler
 
 _build_prompt_ids = qwen3_asr_handler.Qwen3AsrTranscriber._build_prompt_ids
 _causal_mask = qwen3_asr_handler._causal_mask
 _log_mel_spectrogram = qwen3_asr_handler._log_mel_spectrogram
 _mel_filterbank = qwen3_asr_handler._mel_filterbank
 _system_ids = qwen3_asr_handler._system_ids
-qwen3_asr_language = qwen3_asr_handler.qwen3_asr_language
 
 _AUDIO_PAD = qwen3_asr_handler._AUDIO_PAD
 _BLOCKED = qwen3_asr_handler._MASK_BLOCKED
-
-
-# --- language normalization ------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("code", "expected"),
-    [
-        ("en", "English"),
-        ("EN", "English"),
-        ("en-US", "English"),  # locale-style
-        ("zh-CN", "Chinese"),
-        ("yue", "Cantonese"),
-        ("xx", None),  # unsupported
-        (None, None),
-        ("", None),
-    ],
-)
-def test_language_normalization(code, expected) -> None:
-    assert qwen3_asr_language(code) == expected
 
 
 # --- prompt construction ---------------------------------------------------
@@ -168,21 +144,17 @@ class _FakeSession:
         return [SimpleNamespace(name="logits", shape=["batch", "q", 99]), kv, kv]
 
 
-def _fake_model_dir(tmp_path, merged: bool):
-    """A model directory with the right filenames and no real weights."""
-    path = tmp_path / ("merged" if merged else "split")
-    path.mkdir()
-    (path / "config.json").write_text(json.dumps({"decoder": {"hidden_size": 8}}))
-    (path / "tokenizer.json").write_text("{}")
-    (path / "embed_tokens.bin").write_bytes(b"")
-    names = ["encoder.int4.onnx"]
-    names += (
-        ["decoder_merged.int4.onnx"]
-        if merged
-        else ["decoder_init.int4.onnx", "decoder_step.int4.onnx"]
-    )
+def _write_files(directory, names) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
     for name in names:
-        (path / name).write_bytes(b"")
+        (directory / name).write_bytes(b"")
+
+
+def _fake_model_dir(tmp_path):
+    """A model directory with the right filenames and no real weights."""
+    path = tmp_path / "model"
+    _write_files(path, qwen3_asr_handler._MODEL_FILES)
+    (path / "config.json").write_text(json.dumps({"decoder": {"hidden_size": 8}}))
     return path
 
 
@@ -199,28 +171,10 @@ def stub_runtime_fixture(monkeypatch):
     )
 
 
-def test_merged_decoder_is_preferred_when_present(tmp_path, stub_runtime) -> None:
-    model = qwen3_asr_handler.Qwen3AsrTranscriber(
-        str(_fake_model_dir(tmp_path, merged=True)), str(tmp_path)
-    )
-    assert model._merged is not None
-    assert model._decoder_init is None
-    assert model._decoder_step is None
-
-
-def test_split_decoder_is_used_when_merged_is_absent(tmp_path, stub_runtime) -> None:
-    model = qwen3_asr_handler.Qwen3AsrTranscriber(
-        str(_fake_model_dir(tmp_path, merged=False)), str(tmp_path)
-    )
-    assert model._merged is None
-    assert model._decoder_init is not None
-    assert model._decoder_step is not None
-
-
 def test_empty_kv_is_shaped_from_the_graph(tmp_path, stub_runtime) -> None:
     # Taken from present_keys so the cache does not depend on config.json.
     model = qwen3_asr_handler.Qwen3AsrTranscriber(
-        str(_fake_model_dir(tmp_path, merged=True)), str(tmp_path)
+        str(_fake_model_dir(tmp_path)), str(tmp_path)
     )
     assert model._empty_kv.shape == (4, 1, 2, 0, 8)
     assert model._empty_kv.dtype == np.float32
@@ -228,19 +182,158 @@ def test_empty_kv_is_shaped_from_the_graph(tmp_path, stub_runtime) -> None:
 
 def test_prefix_cache_starts_empty(tmp_path, stub_runtime) -> None:
     model = qwen3_asr_handler.Qwen3AsrTranscriber(
-        str(_fake_model_dir(tmp_path, merged=True)), str(tmp_path)
+        str(_fake_model_dir(tmp_path)), str(tmp_path)
     )
     assert model._prefix_key is None
     assert model._prefix_kv is None
 
 
-def test_allow_patterns_cover_both_decoder_layouts() -> None:
-    patterns = set(qwen3_asr_handler._ALLOW_PATTERNS)
-    assert qwen3_asr_handler._MERGED_DECODER in patterns
-    assert "decoder_merged.int4.onnx.data" in patterns
-    # The split layout must still be downloadable.
-    assert {"decoder_init.int4.onnx", "decoder_step.int4.onnx"} <= patterns
-    assert "decoder_weights.int4.data" in patterns
+def test_only_the_int4_merged_files_are_downloaded() -> None:
+    assert set(qwen3_asr_handler._MODEL_FILES) == {
+        "config.json",
+        "tokenizer.json",
+        "embed_tokens.bin",
+        "encoder.int4.onnx",
+        "encoder.int4.onnx.data",
+        "decoder_merged.int4.onnx",
+        "decoder_merged.int4.onnx.data",
+    }
+
+
+# --- finding and downloading the model -------------------------------------
+
+_REPO = "rhasspy/qwen3-asr-0.6b-onnx-int4-merged"
+
+
+@pytest.fixture(name="hub")
+def hub_fixture(monkeypatch):
+    """Record snapshot_download calls; "download" by writing the model files."""
+    calls = []
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        calls.append({"repo_id": repo_id, **kwargs})
+        local_dir = Path(kwargs["local_dir"])
+        _write_files(local_dir, qwen3_asr_handler._MODEL_FILES)
+        return str(local_dir)
+
+    monkeypatch.setattr(qwen3_asr_handler, "snapshot_download", fake_snapshot_download)
+    return calls
+
+
+def test_a_directory_is_used_as_is(tmp_path, hub) -> None:
+    model = tmp_path / "my-model"
+    _write_files(model, qwen3_asr_handler._MODEL_FILES)
+
+    assert qwen3_asr_handler._model_dir(str(model), tmp_path / "data", False) == model
+    assert not hub
+
+
+def test_a_split_export_directory_is_rejected(tmp_path, hub) -> None:
+    """The older decoder_init/decoder_step export is no longer supported."""
+    model = tmp_path / "split-model"
+    _write_files(
+        model,
+        [
+            "config.json",
+            "tokenizer.json",
+            "embed_tokens.bin",
+            "encoder.int4.onnx",
+            "encoder.int4.onnx.data",
+            "decoder_init.int4.onnx",
+            "decoder_step.int4.onnx",
+            "decoder_weights.int4.data",
+        ],
+    )
+
+    with pytest.raises(FileNotFoundError, match="decoder_merged.int4.onnx"):
+        qwen3_asr_handler._model_dir(str(model), tmp_path / "data", False)
+
+    assert not hub
+
+
+def test_a_repo_is_downloaded_into_a_plain_folder(tmp_path, hub) -> None:
+    """Not the Hugging Face cache: its symlinks put each .onnx file and its
+    .data file in different directories, which onnxruntime refuses to load."""
+    model_dir = qwen3_asr_handler._model_dir(_REPO, tmp_path, False)
+
+    assert (
+        model_dir == tmp_path.resolve() / "rhasspy" / "qwen3-asr-0.6b-onnx-int4-merged"
+    )
+    assert len(hub) == 1
+    assert hub[0]["local_dir"] == str(model_dir)
+    assert hub[0]["allow_patterns"] == list(qwen3_asr_handler._MODEL_FILES)
+    assert "cache_dir" not in hub[0]
+
+
+def test_a_downloaded_model_is_loaded_without_the_hub(tmp_path, hub) -> None:
+    qwen3_asr_handler._model_dir(_REPO, tmp_path, False)
+    qwen3_asr_handler._model_dir(_REPO, tmp_path, False)
+
+    assert len(hub) == 1, "the second start must not contact the hub"
+
+
+def test_a_missing_file_is_downloaded(tmp_path, hub) -> None:
+    # An interrupted download: everything but the decoder's weights.
+    local_dir = tmp_path / "rhasspy" / "qwen3-asr-0.6b-onnx-int4-merged"
+    _write_files(
+        local_dir,
+        [
+            name
+            for name in qwen3_asr_handler._MODEL_FILES
+            if name != "decoder_merged.int4.onnx.data"
+        ],
+    )
+
+    qwen3_asr_handler._model_dir(_REPO, tmp_path, False)
+
+    assert len(hub) == 1
+
+
+def test_a_repo_without_the_merged_decoder_is_rejected(tmp_path, monkeypatch) -> None:
+    """The split repo "downloads" fine (non-matching patterns are skipped), so
+    the missing decoder must be caught here rather than inside onnxruntime."""
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        _write_files(
+            Path(kwargs["local_dir"]),
+            [
+                "config.json",
+                "tokenizer.json",
+                "embed_tokens.bin",
+                "encoder.int4.onnx",
+                "encoder.int4.onnx.data",
+            ],
+        )
+        return kwargs["local_dir"]
+
+    monkeypatch.setattr(qwen3_asr_handler, "snapshot_download", fake_snapshot_download)
+
+    with pytest.raises(FileNotFoundError, match="decoder_merged.int4.onnx"):
+        qwen3_asr_handler._model_dir(
+            "rhasspy/qwen3-asr-0.6b-onnx-int4", tmp_path, False
+        )
+
+
+@pytest.mark.parametrize("model", ["/no/such/model", "./no-such-model"])
+def test_a_missing_directory_is_not_sent_to_the_hub(tmp_path, hub, model) -> None:
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        qwen3_asr_handler._model_dir(model, tmp_path, False)
+
+    assert not hub
+
+
+def test_local_files_only_never_downloads(tmp_path, hub) -> None:
+    with pytest.raises(FileNotFoundError):
+        qwen3_asr_handler._model_dir(_REPO, tmp_path, True)
+
+    assert not hub
+
+
+def test_local_files_only_loads_a_downloaded_model(tmp_path, hub) -> None:
+    qwen3_asr_handler._model_dir(_REPO, tmp_path, False)
+
+    assert qwen3_asr_handler._model_dir(_REPO, tmp_path, True)
+    assert len(hub) == 1
 
 
 # --- mel front-end ---------------------------------------------------------

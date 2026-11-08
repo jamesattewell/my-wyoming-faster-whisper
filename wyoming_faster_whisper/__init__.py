@@ -1,4 +1,4 @@
-"""Wyoming server for faster-whisper."""
+"""Wyoming server for Qwen3-ASR."""
 
 from importlib.metadata import version
 

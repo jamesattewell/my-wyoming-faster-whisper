@@ -18,7 +18,6 @@ variable left over in a container.
 import argparse
 import logging
 import os
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -71,6 +70,8 @@ def parse_args(
         if (not action.option_strings) or (action.dest == argparse.SUPPRESS):
             continue
 
+        _check_supported(action)
+
         var_name = env_var_name(action.dest)
         known_vars.add(var_name)
 
@@ -106,6 +107,21 @@ def parse_args(
 # -----------------------------------------------------------------------------
 
 
+def _check_supported(action: argparse.Action) -> None:
+    """Refuse option kinds whose variables this module would mis-read.
+
+    Multi-value options and ``choices`` need parsing and validation that nothing
+    here does (argparse never validates a default), so their variables would be
+    silently taken as one unchecked string. Failing on the parser instead means
+    adding such an option breaks the env_args tests rather than a deployment.
+    """
+    if action.nargs in ("*", "+") or (action.choices is not None):
+        raise TypeError(
+            f"{'/'.join(action.option_strings)}: environment variables do not "
+            "support options with nargs='*'/'+' or choices"
+        )
+
+
 def _is_unset(action: argparse.Action, value: str) -> bool:
     """Report whether an empty variable means "not set" for this option.
 
@@ -116,18 +132,14 @@ def _is_unset(action: argparse.Action, value: str) -> bool:
     empty string or an empty list rather than on argparse's own "the following
     arguments are required".
 
-    Three kinds of option give an empty value a meaning of its own, and keep it:
-    a flag reads it as false, ``--vad-clip`` as "every library", and
-    ``--zeroconf`` as "the default name".
+    Two kinds of option give an empty value a meaning of its own, and keep it:
+    a flag reads it as false, and ``--zeroconf`` as "the default name".
     """
     if value.strip():
         return False
 
     if isinstance(action, _StoreConstAction):
         return False  # --debug= is off, not unset
-
-    if action.nargs in ("*", "+"):
-        return False  # --vad-clip= is the flag with no values
 
     if (action.nargs == "?") and (action.const is not None):
         return False  # --zeroconf= is the flag with its default name
@@ -173,17 +185,6 @@ def _convert(
             if item
         ]
 
-    if action.nargs in ("*", "+"):
-        items = [
-            _value(parser, action, var_name, item)
-            for item in re.split(r"[,\s]+", value.strip())
-            if item
-        ]
-        if (action.nargs == "+") and (not items):
-            parser.error(f"{var_name} needs at least one value")
-
-        return items
-
     if (action.nargs == "?") and (action.const is not None) and (not value):
         # An empty value means the flag with no value, e.g. --zeroconf
         return action.const
@@ -197,19 +198,15 @@ def _value(
     var_name: str,
     value: str,
 ) -> Any:
-    """Apply the action's type conversion and check it against its choices."""
-    typed_value: Any = value
-    if callable(action.type):
-        try:
-            typed_value = action.type(value)
-        except (TypeError, ValueError) as exc:
-            parser.error(f"{var_name}: invalid value {value!r} ({exc})")
+    """Apply the action's type conversion."""
+    if not callable(action.type):
+        return value
 
-    if (action.choices is not None) and (typed_value not in action.choices):
-        choices = ", ".join(str(choice) for choice in action.choices)
-        parser.error(f"{var_name}: {value!r} is not one of: {choices}")
-
-    return typed_value
+    try:
+        return action.type(value)
+    except (TypeError, ValueError) as exc:
+        parser.error(f"{var_name}: invalid value {value!r} ({exc})")
+        raise AssertionError from exc  # unreachable: parser.error exits
 
 
 def _to_bool(parser: argparse.ArgumentParser, var_name: str, value: str) -> bool:

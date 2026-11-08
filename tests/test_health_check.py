@@ -21,8 +21,8 @@ Responder = Callable[[Event, asyncio.StreamWriter], Awaitable[bool]]
 INFO = Info(
     asr=[
         AsrProgram(
-            name="faster-whisper",
-            description="Faster Whisper transcription with CTranslate2",
+            name="qwen3-asr",
+            description="Qwen3-ASR speech recognition with onnxruntime",
             attribution=Attribution(name="Test", url="http://example.com"),
             installed=True,
             version="1.0.0",

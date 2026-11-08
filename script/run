@@ -6,7 +6,7 @@ from pathlib import Path
 
 _DIR = Path(__file__).parent
 _PROGRAM_DIR = _DIR.parent
-_MODULE = _PROGRAM_DIR.name.replace("-", "_")
+_MODULE = "wyoming_faster_whisper"
 _VENV_DIR = _PROGRAM_DIR / ".venv"
 
 if _VENV_DIR.exists():

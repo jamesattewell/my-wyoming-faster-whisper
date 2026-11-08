@@ -6,8 +6,7 @@ green even if the event loop is wedged. A Describe/Info round trip proves the
 accept loop and the event handler are both still running.
 
 Only imports wyoming and this package's environment-variable names, so it stays
-fast and does not depend on the optional extras or on a backend being
-importable.
+fast and does not load onnxruntime or the model.
 """
 
 import argparse

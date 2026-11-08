@@ -14,7 +14,7 @@ pytest.importorskip("aiohttp")
 # pylint: disable=wrong-import-position
 from wyoming.info import Info  # noqa: E402
 
-from wyoming_faster_whisper.dispatch_handler import DispatchEventHandler  # noqa: E402
+from wyoming_faster_whisper.handler import TranscriptionHandler  # noqa: E402
 from wyoming_faster_whisper.hass_api import HomeAssistantError  # noqa: E402
 from wyoming_faster_whisper.name_cache import HassNameCache  # noqa: E402
 from wyoming_faster_whisper.vocabulary import RecognitionContext  # noqa: E402
@@ -41,6 +41,7 @@ class FakeHass:
 
 
 def _cache(hass, **kwargs) -> HassNameCache:
+    kwargs.setdefault("count_tokens", lambda text: len(text.split()))
     kwargs.setdefault("max_tokens", 1000)
     return HassNameCache(hass, **kwargs)
 
@@ -163,16 +164,7 @@ async def test_a_refresh_that_timed_out_is_not_cancelled():
 
     # ...but the fetch kept running, so the next utterance has the new names.
     await asyncio.sleep(0.2)
-    assert await cache.initial_prompt(wait=False) == "Ecobee, Nanit."
-
-
-async def test_streaming_path_does_not_wait():
-    hass = FakeHass(_names("Ecobee"), delay=5.0)
-    cache = _cache(hass, prefix="Vocabulary:")
-    cache.schedule_refresh()
-
-    # wait=False returns immediately with whatever is on hand (nothing yet).
-    assert await cache.initial_prompt(wait=False) == "Vocabulary:"
+    assert await cache.initial_prompt() == "Ecobee, Nanit."
 
 
 # --- snapshot reuse -------------------------------------------------------
@@ -199,15 +191,15 @@ async def test_renamed_entity_replaces_the_snapshot():
     hass.context = _names("Ecobee", "Nanit")
     await cache.refresh()
 
-    assert await cache.initial_prompt(wait=False) == "Ecobee, Nanit."
+    assert await cache.initial_prompt() == "Ecobee, Nanit."
 
 
 # --- once per utterance ---------------------------------------------------
 
 
-def _handler(cache) -> DispatchEventHandler:
+def _handler(cache) -> TranscriptionHandler:
     """A handler with no I/O: only the name-refresh latch is exercised."""
-    return DispatchEventHandler(Info(), None, cache, None, None)
+    return TranscriptionHandler(Info(), None, cache, None, None)
 
 
 async def test_an_utterance_asks_for_exactly_one_refresh():

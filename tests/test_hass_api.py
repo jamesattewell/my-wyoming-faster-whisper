@@ -243,7 +243,7 @@ async def test_the_prompt_is_built_from_a_live_fetch():
     finally:
         await server.close()
 
-    prompt = context.whisper_prompt(lambda text: len(text.split()), max_tokens=1000)
+    prompt = context.biasing_prompt(lambda text: len(text.split()), max_tokens=1000)
     assert prompt == (
         "Office, Study, Upstairs, Top Floor, Office Lamp, Desk Lamp, "
         "Kitchen, Downstairs, Ecobee, Thermostat."

@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional, Sequence
 import pytest
 
 from wyoming_faster_whisper.__main__ import get_parser
-from wyoming_faster_whisper.const import SttLibrary
 from wyoming_faster_whisper.env_args import parse_args
 
 # Enough to satisfy the required options when the test is about something else.
@@ -28,7 +27,8 @@ def test_no_env_vars() -> None:
     assert args.uri == "tcp://0.0.0.0:10300"
     assert args.data_dir == ["/data"]
     assert args.device == "cpu"
-    assert args.beam_size == 0
+    assert args.model == "rhasspy/qwen3-asr-0.6b-onnx-int4-merged"
+    assert not args.vad_clip
     assert not args.debug
 
 
@@ -56,21 +56,21 @@ def test_command_line_wins() -> None:
 def test_type_conversion() -> None:
     """Values go through the option's own type."""
     args = run(
-        WYO_WHISPER_BEAM_SIZE="3",
-        WYO_WHISPER_VAD_THRESHOLD="0.25",
+        WYO_WHISPER_CPU_THREADS="3",
+        WYO_WHISPER_VAD_CLIP_THRESHOLD="0.25",
         WYO_WHISPER_VAD_ENDPOINTING="0.7",
     )
-    assert args.beam_size == 3
-    assert args.vad_threshold == 0.25
+    assert args.cpu_threads == 3
+    assert args.vad_clip_threshold == 0.25
     assert args.vad_endpointing == 0.7
 
 
 def test_invalid_type(capsys: pytest.CaptureFixture) -> None:
     """A value the option's type rejects is an error, not a crash."""
     with pytest.raises(SystemExit):
-        run(WYO_WHISPER_BEAM_SIZE="large")
+        run(WYO_WHISPER_CPU_THREADS="many")
 
-    assert "WYO_WHISPER_BEAM_SIZE" in capsys.readouterr().err
+    assert "WYO_WHISPER_CPU_THREADS" in capsys.readouterr().err
 
 
 def test_vad_endpointing_must_be_positive(capsys: pytest.CaptureFixture) -> None:
@@ -95,9 +95,9 @@ def test_flag_false(value: str) -> None:
 def test_flag_invalid(capsys: pytest.CaptureFixture) -> None:
     """A flag set to something that is neither is an error."""
     with pytest.raises(SystemExit):
-        run(WYO_WHISPER_VAD_FILTER="maybe")
+        run(WYO_WHISPER_VAD_CLIP="maybe")
 
-    assert "WYO_WHISPER_VAD_FILTER" in capsys.readouterr().err
+    assert "WYO_WHISPER_VAD_CLIP" in capsys.readouterr().err
 
 
 def test_append_arg() -> None:
@@ -140,7 +140,7 @@ def test_empty_optional_var_keeps_default() -> None:
     """An empty variable leaves an optional option on its default."""
     args = run(WYO_WHISPER_DEVICE="", WYO_WHISPER_MODEL="", WYO_WHISPER_HASS_TOKEN="")
     assert args.device == "cpu"
-    assert args.model == "auto"
+    assert args.model == "rhasspy/qwen3-asr-0.6b-onnx-int4-merged"
     assert args.hass_token is None
 
 
@@ -157,33 +157,22 @@ def test_empty_secret_file_is_unset(tmp_path: Path) -> None:
     assert run(WYO_WHISPER_HASS_TOKEN_FILE=str(token_path)).hass_token is None
 
 
-def test_list_arg() -> None:
-    """An option taking several values splits on commas or spaces."""
-    args = run(WYO_WHISPER_VAD_CLIP="qwen3-asr, sherpa")
-    assert args.vad_clip == ["qwen3-asr", "sherpa"]
-
-
-def test_list_arg_empty() -> None:
-    """An empty value means the flag with no values (every library)."""
-    args = run(WYO_WHISPER_VAD_CLIP="")
-    assert args.vad_clip == []
-
-
 def test_optional_value_arg() -> None:
     """An option with an optional value takes its constant when empty."""
     assert run(WYO_WHISPER_ZEROCONF="").zeroconf == "faster-whisper"
     assert run(WYO_WHISPER_ZEROCONF="kitchen").zeroconf == "kitchen"
 
 
-def test_choices_checked(capsys: pytest.CaptureFixture) -> None:
-    """A value outside the option's choices is an error."""
-    with pytest.raises(SystemExit):
-        run(WYO_WHISPER_STT_LIBRARY="not-a-library")
+@pytest.mark.parametrize(
+    "kwargs", [{"nargs": "*"}, {"nargs": "+"}, {"choices": ["a", "b"]}]
+)
+def test_unsupported_option_kinds_are_refused(kwargs) -> None:
+    """Their variables would otherwise be read as one unchecked string."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--thing", **kwargs)
 
-    assert "WYO_WHISPER_STT_LIBRARY" in capsys.readouterr().err
-
-    args = run(WYO_WHISPER_STT_LIBRARY="sherpa")
-    assert SttLibrary(args.stt_library) == SttLibrary.SHERPA
+    with pytest.raises(TypeError, match="--thing"):
+        parse_args(parser, [], environ={})
 
 
 def test_secret_file(tmp_path: Path) -> None:

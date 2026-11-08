@@ -1,19 +1,14 @@
 """Tests for --device translation.
 
-Dependency-free: the point of wyoming_faster_whisper.device is that the rules can
-be checked without torch, onnxruntime, or sherpa-onnx installed.
+Dependency-free: the rules can be checked without onnxruntime or a GPU.
 """
 
 import pytest
 
 from wyoming_faster_whisper.device import (
-    ctranslate2_device,
     device_index,
     is_gpu,
     onnx_providers,
-    resolve_compute_type,
-    sherpa_provider,
-    torch_device,
     warn_if_no_onnx_gpu,
 )
 
@@ -27,9 +22,8 @@ def test_cuda_is_gpu(device) -> None:
 
 @pytest.mark.parametrize("device", ["cpu", "CPU", "auto", "mps", "xpu", ""])
 def test_everything_else_is_not_gpu(device) -> None:
-    # Only CUDA counts: it is the one family every backend here can target.
-    # "auto" deliberately reads as non-GPU so the onnxruntime backends get a
-    # provider list that works rather than one that might not.
+    # Only CUDA counts. "auto" deliberately reads as non-GPU so onnxruntime
+    # gets a provider list that works rather than one that might not.
     assert not is_gpu(device)
 
 
@@ -50,32 +44,7 @@ def test_unparsable_index_is_ignored() -> None:
     assert device_index("cuda:first") is None
 
 
-# --- per-backend translation ----------------------------------------------
-
-
-def test_torch_device_passes_through() -> None:
-    # torch understands both forms natively.
-    assert torch_device("cuda") == "cuda"
-    assert torch_device("cuda:1") == "cuda:1"
-    assert torch_device(" cpu ") == "cpu"
-
-
-def test_ctranslate2_splits_the_ordinal_out() -> None:
-    # CTranslate2 takes device_index as a separate argument.
-    assert ctranslate2_device("cuda:1") == ("cuda", 1)
-
-
-def test_ctranslate2_leaves_bare_devices_alone() -> None:
-    assert ctranslate2_device("cuda") == ("cuda", None)
-    assert ctranslate2_device("cpu") == ("cpu", None)
-    # "auto" is CTranslate2's own value and must survive untouched.
-    assert ctranslate2_device("auto") == ("auto", None)
-
-
-def test_sherpa_provider() -> None:
-    assert sherpa_provider("cuda") == "cuda"
-    assert sherpa_provider("cuda:1") == "cuda"
-    assert sherpa_provider("cpu") == "cpu"
+# --- onnxruntime providers -------------------------------------------
 
 
 def test_onnx_providers_on_cpu() -> None:
@@ -95,24 +64,6 @@ def test_onnx_providers_carry_the_device_id() -> None:
         ("CUDAExecutionProvider", {"device_id": 2}),
         "CPUExecutionProvider",
     ]
-
-
-# --- compute type ---------------------------------------------------------
-
-
-def test_compute_type_default_becomes_float16_on_gpu() -> None:
-    assert resolve_compute_type("default", "cuda") == "float16"
-    assert resolve_compute_type("default", "cuda:1") == "float16"
-
-
-def test_compute_type_default_is_left_alone_on_cpu() -> None:
-    assert resolve_compute_type("default", "cpu") == "default"
-
-
-def test_explicit_compute_type_is_never_overridden() -> None:
-    # Someone asking for int8_float16 on a GPU means it.
-    assert resolve_compute_type("int8_float16", "cuda") == "int8_float16"
-    assert resolve_compute_type("int8", "cuda") == "int8"
 
 
 # --- silent-CPU-fallback warning ------------------------------------------

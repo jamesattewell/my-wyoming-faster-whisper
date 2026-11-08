@@ -1,7 +1,3 @@
-[MASTER]
-ignore=faster_whisper
-ignored-modules=torch,transformers
-
 [MESSAGES CONTROL]
 disable=
   format,

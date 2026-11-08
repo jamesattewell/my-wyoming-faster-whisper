@@ -2,21 +2,19 @@
 import argparse
 import asyncio
 import logging
-import platform
-import re
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Optional
 
-import faster_whisper
 from wyoming.info import AsrModel, AsrProgram, Attribution, Info
 from wyoming.server import AsyncServer, AsyncTcpServer
 
 from . import __version__
-from .const import AUTO_LANGUAGE, AUTO_MODEL, HASS_API_URL, SttLibrary, base_language
-from .dispatch_handler import DispatchEventHandler
+from .const import AUTO_LANGUAGE, DEFAULT_MODEL, HASS_API_URL, Transcriber
 from .env_args import ENV_PREFIX
 from .env_args import parse_args as parse_args_with_env
-from .models import ModelLoader, is_distil_whisper
+from .handler import TranscriptionHandler
+from .languages import SUPPORTED_LANGUAGES, qwen3_asr_language
+from .qwen3_asr_handler import Qwen3AsrTranscriber
 from .vocabulary import DEFAULT_PROMPT_MAX_TOKENS
 
 if TYPE_CHECKING:
@@ -58,7 +56,10 @@ def get_parser() -> argparse.ArgumentParser:
     )
     #
     parser.add_argument(
-        "--model", default=AUTO_MODEL, help=f"Name of model to use (or {AUTO_MODEL})"
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Hugging Face repo id or local directory of a Qwen3-ASR ONNX export "
+        f"(default: {DEFAULT_MODEL})",
     )
     parser.add_argument(
         "--data-dir",
@@ -74,7 +75,7 @@ def get_parser() -> argparse.ArgumentParser:
         "--device",
         default="cpu",
         help="Device to use for inference: cpu, cuda, or cuda:N (default: cpu). "
-        "CUDA requires the GPU image or GPU-enabled wheels; see README.",
+        "CUDA requires onnxruntime-gpu; see README.",
     )
     parser.add_argument(
         "--language",
@@ -82,56 +83,14 @@ def get_parser() -> argparse.ArgumentParser:
         help=f"Default language to set for transcription (default: {AUTO_LANGUAGE})",
     )
     parser.add_argument(
-        "--compute-type",
-        default="default",
-        help="Compute type for faster-whisper (float16, int8, etc.); "
-        "defaults to float16 on CUDA and to the model's own type on CPU",
-    )
-    parser.add_argument(
-        "--beam-size",
-        type=int,
-        default=0,
-        help="Size of beam during decoding (0 for auto)",
-    )
-    parser.add_argument(
         "--cpu-threads",
         default=4,
         type=int,
-        help="Number of CPU threads to use for inference (default: 4, faster-whisper, sherpa-onnx, and qwen3-asr)",
+        help="Number of CPU threads to use for inference (default: 4)",
     )
     parser.add_argument(
         "--initial-prompt",
-        help="Optional text to provide as a prompt for the first window "
-        "(faster-whisper); used as biasing context for entity names (qwen3-asr)",
-    )
-    parser.add_argument(
-        "--whisper-task",
-        default="transcribe",
-        help="Task for whisper to do (default: transcribe)",
-        choices=["transcribe", "translate"],
-    )
-    parser.add_argument(
-        "--vad-filter",
-        action="store_true",
-        help="Enable Silero VAD to filter out non-speech which can reduce hallucinations (default: false, faster-whisper only)",
-    )
-    parser.add_argument(
-        "--vad-threshold",
-        type=float,
-        default=0.5,
-        help="VAD speech probability threshold (default: 0.5, faster-whisper only)",
-    )
-    parser.add_argument(
-        "--vad-min-speech-ms",
-        type=int,
-        default=250,
-        help="VAD minimum speech duration in ms (default: 250, faster-whisper only)",
-    )
-    parser.add_argument(
-        "--vad-min-silence-ms",
-        type=int,
-        default=2000,
-        help="VAD minimum silence duration in ms to split (default: 2000, faster-whisper only)",
+        help="Biasing context for the model, e.g. a list of names to spell right",
     )
     parser.add_argument(
         "--vad-endpointing",
@@ -141,12 +100,9 @@ def get_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--vad-clip",
-        nargs="*",
-        metavar="STT_LIBRARY",
-        choices=[lib.value for lib in SttLibrary if lib != SttLibrary.AUTO],
+        action="store_true",
         help="Use pysilero-vad to clip leading/trailing silence before "
-        "transcription (default: disabled). Pass --vad-clip for every library, or "
-        "name the libraries it applies to, e.g. --vad-clip qwen3-asr",
+        "transcription (default: disabled)",
     )
     parser.add_argument(
         "--vad-clip-threshold",
@@ -159,18 +115,6 @@ def get_parser() -> argparse.ArgumentParser:
         type=int,
         default=400,
         help="Context kept around speech for --vad-clip in ms (default: 400)",
-    )
-    parser.add_argument(
-        "--stt-library",
-        choices=[lib.value for lib in SttLibrary],
-        default=SttLibrary.AUTO,
-        help="Set library to use for speech-to-text (may require extra dependencies)",
-    )
-    parser.add_argument(
-        "--sherpa-streaming",
-        action="store_true",
-        help="Use sherpa-onnx OnlineRecognizer for true streaming transcription "
-        "(sherpa only; requires a streaming model, e.g. a streaming zipformer)",
     )
     parser.add_argument(
         "--local-files-only",
@@ -201,8 +145,7 @@ def get_parser() -> argparse.ArgumentParser:
         "--hass-prompt-max-tokens",
         type=int,
         default=DEFAULT_PROMPT_MAX_TOKENS,
-        help="Token budget for names in the prompt "
-        f"(default: {DEFAULT_PROMPT_MAX_TOKENS}, max useful: 223 for Whisper)",
+        help=f"Token budget for names in the prompt (default: {DEFAULT_PROMPT_MAX_TOKENS})",
     )
     parser.add_argument(
         "--hass-prompt-timeout",
@@ -239,84 +182,23 @@ async def main() -> None:
     )
     _LOGGER.debug(args)
 
-    args.stt_library = SttLibrary(args.stt_library)
+    language = None if args.language == AUTO_LANGUAGE else args.language
+    _warn_if_language_unsupported(language)
 
-    # argparse gives None when --vad-clip is absent, [] when it is passed with no
-    # values (every library), and the named libraries otherwise.
-    vad_clip = args.vad_clip is not None
-    vad_clip_libraries = (
-        {SttLibrary(value) for value in args.vad_clip} if args.vad_clip else None
-    )
-
-    machine = platform.machine().lower()
-    is_arm = ("arm" in machine) or ("aarch" in machine)
-
-    if args.beam_size <= 0:
-        args.beam_size = 1 if is_arm else 5
-        _LOGGER.debug("Beam size automatically selected: %s", args.beam_size)
-
-    # Resolve model name
-    model_name = args.model
-    model_match = re.match(r"^(tiny|base|small|medium)[.-]int8$", args.model)
-    if model_match:
-        # Original models re-uploaded to huggingface
-        model_size = model_match.group(1)
-        model_name = f"{model_size}-int8"
-        args.model = f"rhasspy/faster-whisper-{model_name}"
-
-    if args.language == AUTO_LANGUAGE:
-        # Whisper does not understand auto
-        args.language = None
-
-    if args.model == AUTO_MODEL:
-        args.model = None
-
-    vad_parameters: Optional[Dict[str, Any]] = None
-    if args.vad_filter:
-        vad_parameters = {
-            "threshold": args.vad_threshold,
-            "min_speech_duration_ms": args.vad_min_speech_ms,
-            "min_silence_duration_ms": args.vad_min_silence_ms,
-        }
-
-    loader = ModelLoader(
-        preferred_stt_library=args.stt_library,
-        preferred_language=args.language,
-        download_dir=args.download_dir,
+    _LOGGER.debug("Loading model '%s' (device=%s)", args.model, args.device)
+    transcriber = Qwen3AsrTranscriber(
+        args.model,
+        args.download_dir,
         local_files_only=args.local_files_only,
-        model=args.model,
-        compute_type=args.compute_type,
-        device=args.device,
-        beam_size=args.beam_size,
         cpu_threads=args.cpu_threads,
-        initial_prompt=args.initial_prompt,
-        vad_parameters=vad_parameters,
-        whisper_task=args.whisper_task,
-        sherpa_streaming=args.sherpa_streaming,
-        vad_clip=vad_clip,
-        vad_clip_threshold=args.vad_clip_threshold,
-        vad_clip_pad_ms=args.vad_clip_pad_ms,
-        vad_clip_libraries=vad_clip_libraries,
+        device=args.device,
     )
 
-    _warn_if_prompt_unsupported(args, loader)
+    names = await _load_names(args, transcriber)
 
-    # Built from the loader so the advertised languages follow the backend that
-    # will actually run, not the Whisper list.
-    languages = sorted(loader.supported_languages())
-    _warn_if_language_unsupported(args.language, languages)
     wyoming_info = build_info(
-        model_name,
-        languages,
-        requires_external_vad=args.vad_endpointing is None,
+        args.model, requires_external_vad=args.vad_endpointing is None
     )
-    _LOGGER.debug("Reporting %s language(s)", len(languages))
-
-    # Load model
-    _LOGGER.debug("Pre-loading transcriber")
-    await loader.load_transcriber()
-
-    names = await _load_names(args)
 
     server = AsyncServer.from_uri(args.uri)
 
@@ -336,37 +218,30 @@ async def main() -> None:
     _LOGGER.info("Ready")
     await server.run(
         partial(
-            DispatchEventHandler,
+            TranscriptionHandler,
             wyoming_info,
-            loader,
+            transcriber,
             names,
+            language=language,
+            initial_prompt=args.initial_prompt,
+            vad_clip=args.vad_clip,
+            vad_clip_threshold=args.vad_clip_threshold,
+            vad_clip_pad_ms=args.vad_clip_pad_ms,
             vad_endpointing=args.vad_endpointing,
         )
     )
 
 
-def build_info(
-    model_name: str,
-    languages: List[str],
-    *,
-    requires_external_vad: bool = True,
-) -> Info:
-    """Build Wyoming service metadata.
-
-    ``languages`` comes from ModelLoader.supported_languages(): a fixed list
-    would over-report whenever a backend narrower than Whisper is configured
-    (GigaAM is Russian-only, SenseVoice covers five languages) and under-report
-    the codes Whisper has no token for (Qwen3-ASR's "fil", and "zh-HK", which
-    Home Assistant needs to route a Cantonese pipeline).
-    """
+def build_info(model_name: str, *, requires_external_vad: bool = True) -> Info:
+    """Build Wyoming service metadata."""
     return Info(
         asr=[
             AsrProgram(
-                name="faster-whisper",
-                description="Faster Whisper transcription with CTranslate2",
+                name="qwen3-asr",
+                description="Qwen3-ASR speech recognition with onnxruntime",
                 attribution=Attribution(
-                    name="Guillaume Klein",
-                    url="https://github.com/guillaumekln/faster-whisper/",
+                    name="Qwen",
+                    url="https://huggingface.co/Qwen",
                 ),
                 installed=True,
                 version=__version__,
@@ -376,12 +251,12 @@ def build_info(
                         name=model_name,
                         description=model_name,
                         attribution=Attribution(
-                            name="Systran",
-                            url="https://huggingface.co/Systran",
+                            name="Qwen",
+                            url="https://huggingface.co/Qwen",
                         ),
                         installed=True,
-                        languages=languages,
-                        version=faster_whisper.__version__,
+                        languages=sorted(SUPPORTED_LANGUAGES),
+                        version=None,
                     )
                 ],
             )
@@ -392,60 +267,26 @@ def build_info(
 # -----------------------------------------------------------------------------
 
 
-def _warn_if_language_unsupported(
-    language: Optional[str], languages: List[str]
-) -> None:
-    """Warn at startup when --language names something the backend cannot do.
+def _warn_if_language_unsupported(language: Optional[str]) -> None:
+    """Warn at startup when --language names something the model cannot do.
 
-    Unvalidated, a typo or a language the configured backend does not cover only
-    shows up as every transcription being auto-detected (or, on a monolingual
-    model, silently decoded as the wrong language). A region-qualified tag is
-    accepted: the backends normalize it themselves.
+    Unvalidated, a typo only shows up as every transcription being
+    auto-detected. A region-qualified tag is accepted.
     """
-    if not language:
-        return
-
-    if language in languages:
-        return
-
-    if base_language(language) in {base_language(code) for code in languages}:
+    if (not language) or (qwen3_asr_language(language) is not None):
         return
 
     _LOGGER.warning(
-        "Language '%s' is not supported by the selected backend (supported: %s). "
+        "Language '%s' is not supported by Qwen3-ASR (supported: %s). "
         "Transcription will fall back to auto-detection.",
         language,
-        ", ".join(languages),
+        ", ".join(sorted(SUPPORTED_LANGUAGES)),
     )
 
 
-def _warn_if_prompt_unsupported(args: argparse.Namespace, loader: ModelLoader) -> None:
-    """Warn when a prompt is being sent to a model that cannot handle one.
-
-    Distil-Whisper checkpoints degrade rather than benefit: the prompt truncates
-    or derails the transcription instead of biasing it. The prompt is still sent
-    -- this only warns -- because the damage is size-dependent and a very short
-    --initial-prompt may be harmless.
-    """
-    if not (args.initial_prompt or args.hass_token):
-        return
-
-    if loader.resolve_stt_library() != SttLibrary.FASTER_WHISPER:
-        return
-
-    if not is_distil_whisper(args.model):
-        return
-
-    _LOGGER.warning(
-        "Model '%s' is a Distil-Whisper model, which is not compatible with "
-        "prompting: --initial-prompt and --hass-token/--hass-api will degrade "
-        "transcription instead of improving it. Use a standard Whisper model "
-        "for name biasing.",
-        args.model,
-    )
-
-
-async def _load_names(args: argparse.Namespace) -> Optional["HassNameCache"]:
+async def _load_names(
+    args: argparse.Namespace, transcriber: Transcriber
+) -> Optional["HassNameCache"]:
     """Set up biasing toward Home Assistant's names, if a token was given."""
     if not args.hass_token:
         return None
@@ -461,6 +302,7 @@ async def _load_names(args: argparse.Namespace) -> Optional["HassNameCache"]:
 
     names = HassNameCache(
         HomeAssistant(args.hass_token, api_url=args.hass_api),
+        transcriber.count_prompt_tokens,
         prefix=args.initial_prompt,
         max_tokens=args.hass_prompt_max_tokens,
         refresh_seconds=args.hass_refresh_seconds,

@@ -2,7 +2,6 @@ FROM debian:bookworm-slim
 ARG TARGETARCH
 ARG TARGETVARIANT
 
-# Install faster-whisper
 WORKDIR /usr/src
 
 COPY ./pyproject.toml ./
@@ -18,12 +17,7 @@ RUN \
         setuptools \
         wheel \
     && .venv/bin/pip3 install --no-cache-dir \
-        --extra-index-url 'https://download.pytorch.org/whl/cpu' \
-        'torch==2.6.0' \
-    \
-    && .venv/bin/pip3 install --no-cache-dir \
-        --extra-index-url https://www.piwheels.org/simple \
-        -e '.[zeroconf,transformers,sherpa,onnx-asr,qwen3-asr,hass]' \
+        -e '.[zeroconf,hass]' \
     \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,17 +25,16 @@ COPY ./ ./
 
 # Keep every cache on the /data volume instead of the container's filesystem.
 # Model files already go there (--download-dir defaults to the first --data-dir),
-# but the libraries also write caches that no per-call argument reaches: the Xet
-# chunk cache used during hub downloads is $HF_HOME/xet and can run to several
-# GB, and torch/others fall back to $XDG_CACHE_HOME. Unset, all of that lands in
+# but huggingface_hub also writes a cache that no per-call argument reaches: the
+# Xet chunk cache used during downloads is $HF_HOME/xet and can run to several
+# GB. Anything else falls back to $XDG_CACHE_HOME. Unset, all of that lands in
 # $HOME/.cache - which is thrown away on every container recreate, and is an
 # unwritable /.cache when the container runs as a uid with no passwd entry.
 #
 # These have to be environment variables: huggingface_hub reads them into
 # constants at import time, so setting them from Python would be too late.
 ENV HF_HOME=/data \
-    XDG_CACHE_HOME=/data \
-    MODELSCOPE_CACHE=/data/modelscope
+    XDG_CACHE_HOME=/data
 
 EXPOSE 10300
 
