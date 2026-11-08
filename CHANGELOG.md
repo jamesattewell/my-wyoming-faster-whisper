@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Qwen3-ASR no longer returns the biasing prompt as the transcript when the
+  audio is speech-like noise (a TV, people talking in another room) that gets
+  past VAD. The model has no "no speech" output and reads the Home Assistant
+  names back instead; decoding now stops as soon as the transcript lists three
+  of the prompt's names in order (ignoring case, spacing and punctuation), and
+  returns an empty transcript. A real command naming a device or two is
+  unaffected
+- `convert_qwen3_asr.py` builds the merged model folder for other model sizes
+  (e.g. 1.7B) from Qwen's PyTorch checkpoint. It is run by hand and needs its
+  own environment with PyTorch; see "Other Model Sizes" in the README
+
 - **Breaking:** Qwen3-ASR is now the only backend. faster-whisper,
   transformers, sherpa-onnx, onnx-asr and FunASR are removed, along with the
   per-language backend routing and model guessing that chose between them

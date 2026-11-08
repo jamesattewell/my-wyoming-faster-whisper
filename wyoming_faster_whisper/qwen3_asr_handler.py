@@ -10,6 +10,13 @@ template's system turn to bias decoding toward specific spellings, so
 ``--initial-prompt`` can carry Home Assistant entity names ("Vocabulary: Ecobee,
 office lamp.") and fix names that would otherwise be transcribed phonetically.
 
+The catch is that the model has no "no speech" output. On audio it cannot read,
+such as a TV or people talking in the next room (which VAD lets through), it
+copies the biasing context out as the transcript, so the user's entity list
+would go to the intent pipeline as if they had said it. ``transcribe`` stops
+decoding as soon as the output starts reading the names back and returns "" (see
+_ECHO_MIN_NAMES).
+
 The decoder is the *merged* export (``decoder_merged.int4.onnx``): one graph
 taking a KV cache *and* a dynamic sequence length. Because the biasing prompt
 sits in the system turn, ahead of the audio, its KV depends only on the prompt
@@ -28,7 +35,7 @@ import logging
 import threading
 import wave
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import onnxruntime as ort
@@ -66,6 +73,14 @@ _ASR_TEXT = 151704  # <asr_text>: everything before it is the language preamble
 _EOS_IDS = frozenset((151643, 151645))
 
 _MAX_NEW_TOKENS = 256
+
+# Echo guard. A real command mentions a name or two from the biasing list; an
+# echo reads the list out in order. So a transcript containing this many
+# consecutive names from the prompt is treated as an echo. Both sides are
+# normalized first (see _normalize): the 1.7B model echoes with its own casing
+# and spacing ("office, study, up stairs, ..."), so matching tokens is too literal.
+_ECHO_MIN_NAMES = 3
+_SEPARATORS = ",\uff0c\u3001"  # vocabulary.py joins names with ", "; also "，" "、"
 
 _ENCODER = "encoder.int4.onnx"
 _DECODER = "decoder_merged.int4.onnx"
@@ -217,6 +232,30 @@ def _system_ids(context_ids: Sequence[int]) -> List[int]:
     it precedes the audio, so nothing in it changes from one utterance to the next.
     """
     return [_IM_START, _SYSTEM, _NEWLINE, *context_ids, _IM_END, _NEWLINE]
+
+
+def _normalize(text: str) -> str:
+    """Lowercase letters and digits, with every separator as "," and nothing else.
+
+    "Up stairs" and "Upstairs" both become "upstairs", so differences in casing,
+    spacing and punctuation do not hide an echo.
+    """
+    return "".join(
+        "," if char in _SEPARATORS else char
+        for char in text.lower()
+        if char.isalnum() or char in _SEPARATORS
+    )
+
+
+def _echo_patterns(prompt: Optional[str]) -> FrozenSet[str]:
+    """Normalized runs of the prompt's names that a transcript must not contain."""
+    names = [name for name in _normalize(prompt or "").split(",") if name]
+    n = _ECHO_MIN_NAMES
+    if len(names) < n:
+        # Too few names for a run: the whole list, if it is a list at all.
+        return frozenset([",".join(names)]) if len(names) > 1 else frozenset()
+
+    return frozenset(",".join(names[i : i + n]) for i in range(len(names) - n + 1))
 
 
 def _causal_mask(q_len: int, past_len: int) -> np.ndarray:
@@ -400,8 +439,14 @@ class Qwen3AsrTranscriber(Transcriber):
         audio_features: np.ndarray,
         prompt_ids: List[int],
         n_system: int,
-    ) -> List[int]:
-        """Greedy decode reusing the system turn's KV across utterances."""
+        echo_patterns: FrozenSet[str] = frozenset(),
+    ) -> Optional[List[int]]:
+        """Greedy decode reusing the system turn's KV across utterances.
+
+        Returns None, without finishing, as soon as the output contains one of
+        ``echo_patterns``: it is reading the prompt back, and reading out the
+        rest of a long prompt would only waste time.
+        """
         past_keys, past_values = self._prefix_cache(prompt_ids[:n_system])
 
         # Everything after the system turn: the audio placeholders and the
@@ -424,7 +469,13 @@ class Qwen3AsrTranscriber(Transcriber):
         tokens = [token]
         position = len(prompt_ids)
 
-        while (token not in _EOS_IDS) and (len(tokens) < _MAX_NEW_TOKENS):
+        while True:
+            if echo_patterns and self._is_echo(tokens, echo_patterns):
+                return None
+
+            if (token in _EOS_IDS) or (len(tokens) >= _MAX_NEW_TOKENS):
+                break
+
             logits, past_keys, past_values = self._run_decoder(
                 self._embed_tokens[token].astype(np.float32)[np.newaxis, np.newaxis, :],
                 [position],
@@ -437,6 +488,14 @@ class Qwen3AsrTranscriber(Transcriber):
 
         return tokens
 
+    def _is_echo(self, tokens: List[int], echo_patterns: FrozenSet[str]) -> bool:
+        """Whether the transcript so far reads out a run of the prompt's names."""
+        if _ASR_TEXT in tokens:
+            tokens = tokens[tokens.index(_ASR_TEXT) + 1 :]
+
+        text = _normalize(self._tokenizer.decode(tokens, skip_special_tokens=True))
+        return ("," in text) and any(pattern in text for pattern in echo_patterns)
+
     def transcribe(
         self,
         wav_path: Union[str, Path],
@@ -448,6 +507,11 @@ class Qwen3AsrTranscriber(Transcriber):
         WAV file must be 16Khz 16-bit mono audio. Decoding is greedy.
         initial_prompt is used as biasing context rather than as a transcript
         prefix.
+
+        The model has no "no speech" output: given audio it cannot read
+        (speech-like noise gets past VAD), it copies the biasing context out as
+        the transcript. If the output starts copying the context, "" is
+        returned instead.
         """
         wav_file: wave.Wave_read = wave.open(str(wav_path), "rb")
         with wav_file:
@@ -472,8 +536,14 @@ class Qwen3AsrTranscriber(Transcriber):
         )
 
         tokens = self._generate(
-            audio_features, prompt_ids, len(_system_ids(context_ids))
+            audio_features,
+            prompt_ids,
+            len(_system_ids(context_ids)),
+            _echo_patterns(initial_prompt),
         )
+        if tokens is None:
+            _LOGGER.debug("Transcript was echoing the biasing prompt; dropping it")
+            return ""
 
         # The model writes the detected language before <asr_text>; drop it.
         if _ASR_TEXT in tokens:

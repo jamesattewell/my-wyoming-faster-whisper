@@ -61,6 +61,33 @@ Face cache.
 Decoding is greedy, and `--cpu-threads` (default 4) sets onnxruntime's thread
 count.
 
+### Other Model Sizes
+
+Only the 0.6B model is published in the merged layout. `convert_qwen3_asr.py`,
+at the root of this repo, builds the folder for another size from Qwen's
+PyTorch checkpoint. It is run by hand, in an environment of its own because it
+needs PyTorch (which the server does not):
+
+```sh
+python3 -m venv .venv-convert
+.venv-convert/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+.venv-convert/bin/pip install "transformers>=5.13" onnx onnxruntime onnxscript \
+    safetensors huggingface_hub numpy
+
+.venv-convert/bin/python convert_qwen3_asr.py --size 1.7b \
+    --out local/qwen3-asr-1.7b-onnx-int4-merged
+```
+
+Then pass that folder as `--model`. For 1.7B it downloads ~10 GB into
+`local/convert` (`--work-dir`), takes a couple of minutes, and needs ~12–15 GB
+of RAM at its peak. Keep the work directory off tmpfs (`/tmp` on many systems),
+whose files are held in RAM. Run with `--size 0.6b`, it reproduces the published
+model: the decoder and encoder weights come out byte-identical.
+
+On the test recordings 1.7B transcribes the same as 0.6B, except that it does
+not pick up "Ecobee" from the prompt ("incubi"). It is about twice as slow: on
+an x86 desktop with 4 threads, ~1.5 s against ~0.7 s for a 3 s command.
+
 ## Server-side VAD Endpointing
 
 By default, the server waits for the client to send `audio-stop` before it
