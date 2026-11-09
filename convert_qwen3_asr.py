@@ -22,13 +22,13 @@ What goes into the folder:
   of new tokens, which is what lets the server reuse the biasing prompt's KV.
   Quantized with the recipe of the published int4 decoders (RTN, block 64,
   asymmetric, accuracy level 4).
-* encoder.int4.onnx (+ .data): andrewleech/qwen3-asr-<size>-onnx's encoder
-  (FP32 despite its name) quantized with the same recipe.
+* encoder.int4.onnx (+ .data): andrewleech/qwen3-asr-<size>-onnx's audio
+  encoder, unchanged. It is FP32 whatever its name says; only its weights are
+  moved into the .data file the server expects. It is not quantized: int4 puts
+  the audio features ~20% off the original model's, enough that 1.7B writes
+  "incubi" for "Ecobee" with Ecobee in the prompt. (The published 0.6B model
+  has an int4 encoder, so this does not reproduce it byte for byte.)
 * embed_tokens.bin, tokenizer.json, config.json: from that repo, unchanged.
-
-For 0.6B this reproduces the published rhasspy model: the decoder and encoder
-weights are byte-identical. For 1.7B, transcripts match the published split
-export (andrewleech/qwen3-asr-1.7b-onnx) exactly.
 
 Resources for 1.7B: ~10 GB of downloads, ~2 minutes, and ~12-15 GB of RAM at
 peak (0.6B: ~5 GB). Each phase runs in its own process so memory is returned
@@ -51,7 +51,7 @@ _SIZES = {
     "0.6b": ("Qwen/Qwen3-ASR-0.6B-hf", "andrewleech/qwen3-asr-0.6b-onnx"),
     "1.7b": ("Qwen/Qwen3-ASR-1.7B-hf", "andrewleech/qwen3-asr-1.7b-onnx"),
 }
-# Taken unchanged from the ONNX repo (the encoder is requantized).
+# Taken unchanged from the ONNX repo.
 _ONNX_FILES = ["encoder.int4.onnx", "embed_tokens.bin", "tokenizer.json", "config.json"]
 
 _DECODER = "decoder_merged.int4.onnx"
@@ -429,6 +429,25 @@ def quantize(src: str, dst: str) -> None:
     _peak("quantize")
 
 
+def copy_encoder(src: str, dst: str) -> None:
+    """Copy the encoder unchanged, with its weights in dst + ".data" as the server expects."""
+    import onnx
+
+    for name in (dst, dst + ".data"):
+        if os.path.exists(name):
+            os.remove(name)  # onnx appends to existing external data
+    onnx.save_model(
+        onnx.load(src),
+        dst,
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location=os.path.basename(dst) + ".data",
+        size_threshold=1024,
+    )
+    print(f"Copied {os.path.basename(src)} (FP32)")
+    _peak("encoder")
+
+
 # --- check -----------------------------------------------------------------
 
 
@@ -505,7 +524,7 @@ def main() -> None:
             "export": lambda: export(checkpoint_dir, work),
             "check-fp32": lambda: check(fp32_path, reference_path, strict=True),
             "quantize": lambda: quantize(fp32_path, os.path.join(args.out, _DECODER)),
-            "encoder": lambda: quantize(
+            "encoder": lambda: copy_encoder(
                 os.path.join(onnx_dir, _ENCODER), os.path.join(args.out, _ENCODER)
             ),
             "check": lambda: check(

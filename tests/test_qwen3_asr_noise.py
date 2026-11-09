@@ -94,20 +94,6 @@ def _write_wav(path: Path, audio: np.ndarray, gain: float = 0.5) -> bytes:
     return pcm
 
 
-# Commands a model gets wrong whatever the guard does, as the published export
-# of the same model does too (checked against andrewleech/qwen3-asr-1.7b-onnx).
-_KNOWN_MISSES = {
-    ("1.7b", "whats-the-temperature-of-the-ecobee.wav"): (
-        "1.7B int4 does not take the Ecobee bias: 'incubi' with the prompt"
-    ),
-}
-
-
-@pytest.fixture(name="model_size")
-def model_size_fixture(request) -> str:
-    return request.node.callspec.params["model"]
-
-
 @pytest.fixture(name="model", scope="module", params=sorted(_MODELS))
 def model_fixture(request, tmp_path_factory):
     model_dir = _MODELS[request.param]
@@ -193,12 +179,8 @@ def test_an_echo_is_cut_short(model, tmp_path, monkeypatch) -> None:
         ("set-volume-to-30-percent.wav", "en", "Set volume to thirty percent."),
     ],
 )
-def test_real_commands_are_unaffected(
-    model, model_size, wav_name, language, expected
-) -> None:
+def test_real_commands_are_unaffected(model, wav_name, language, expected) -> None:
     text = model.transcribe(_DIR / wav_name, language, initial_prompt=_HASS_PROMPT)
-    if (text != expected) and (model_size, wav_name) in _KNOWN_MISSES:
-        pytest.xfail(_KNOWN_MISSES[(model_size, wav_name)])
     assert text == expected
 
 
